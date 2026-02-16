@@ -130,20 +130,58 @@ def extract_season_episode(text):
     return None, None
 
 def parse_content_info(message_text):
-    """تحليل نص الرسالة لاستخراج المعلومات (محسّن)."""
+    """تحليل نص الرسالة لاستخراج المعلومات (محسّن جداً للمسلسلات العربية)."""
     if not message_text:
         return None, None, None, None
     
     text_cleaned = message_text.strip()
     original_text = text_cleaned  # للاحتفاظ به للتسجيل
     
-    # 1. أنماط الأفلام الصريحة
-    # فيلم X الجزء Y
+    # ========== 1. أنماط المسلسلات مع الموسم والحلقة (الأكثر شيوعاً) ==========
+    # مسلسل X الموسم Y الحلقة Z
+    series_patterns = [
+        r'^(?:مسلسل\s+)?(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$',
+        r'^(?:مسلسل\s+)?(.*?)\s+[-\s]*الموسم\s+(\d+)\s+[-\s]*الحلقة\s+(\d+)$',  # مع واصلات
+        r'^(?:مسلسل\s+)?(.*?)\s+الموسم\s+(\d+)[-\s]+(\d+)$',  # الموسم X - Y
+        r'^(?:مسلسل\s+)?(.*?)\s+Season\s+(\d+)\s+Episode\s+(\d+)$',
+    ]
+    for pattern in series_patterns:
+        match = re.search(pattern, text_cleaned, re.IGNORECASE)
+        if match:
+            raw_name = match.group(1).strip()
+            season_num = int(match.group(2))
+            episode_num = int(match.group(3))
+            clean_name_text = clean_name(raw_name)
+            # Debug: تأكد من النتيجة
+            print(f"   ✅ تحليل (مسلسل): {clean_name_text} - الموسم {season_num} الحلقة {episode_num}")
+            return clean_name_text, 'series', season_num, episode_num
+    
+    # ========== 2. أنماط المسلسلات مع الحلقة فقط (افتراضي الموسم 1) ==========
+    series_episode_patterns = [
+        r'^(?:مسلسل\s+)?(.*?)\s+الحلقة\s+(\d+)$',
+        r'^(?:مسلسل\s+)?(.*?)\s+Episode\s+(\d+)$',
+        r'^(?:مسلسل\s+)?(.*?)\s+ح(\d+)$',
+        r'^(.*?)\s+(\d+)$',  # أي اسم مع رقم في النهاية (قد يكون مسلسل)
+    ]
+    for pattern in series_episode_patterns:
+        match = re.search(pattern, text_cleaned, re.IGNORECASE)
+        if match:
+            raw_name = match.group(1).strip()
+            episode_num = int(match.group(2))
+            # إذا كان النص يحتوي على كلمة "فيلم"، نتعامل كفيلم
+            if 'فيلم' in raw_name.lower():
+                # هذا فيلم وليس مسلسل
+                continue
+            clean_name_text = clean_name(raw_name)
+            print(f"   ✅ تحليل (مسلسل بدون موسم): {clean_name_text} - الحلقة {episode_num}")
+            return clean_name_text, 'series', 1, episode_num
+    
+    # ========== 3. أنماط الأفلام ==========
     film_patterns = [
-        r'^فيلم\s+(.+?)\s+الجزء\s+(\d+)$',
-        r'^فيلم\s+(.+?)[-_](\d+)$',
-        r'^فيلم\s+(.+?)\s+(\d+)$',
-        r'^فيلم\s+(.+?)$',  # فيلم بدون رقم (افتراضي الجزء 1)
+        r'^(?:فيلم\s+)?(.*?)\s+الجزء\s+(\d+)$',
+        r'^(?:فيلم\s+)?(.*?)[-_](\d+)$',
+        r'^(?:فيلم\s+)?(.*?)\s+(\d+)$',
+        r'^(?:فيلم\s+)?(.*?)$',  # فيلم بدون رقم (افتراضي الجزء 1)
     ]
     for pattern in film_patterns:
         match = re.search(pattern, text_cleaned, re.IGNORECASE)
@@ -160,61 +198,12 @@ def parse_content_info(message_text):
                 else:
                     season_num = 1
             clean_name_text = clean_name(raw_name)
+            print(f"   ✅ تحليل (فيلم): {clean_name_text} - الجزء {season_num}")
             return clean_name_text, 'movie', season_num, 1
     
-    # 2. أنماط المسلسلات الصريحة مع الموسم والحلقة
-    series_season_episode_patterns = [
-        r'^مسلسل\s+(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$',
-        r'^(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$',
-        r'^(.*?)\s+[Ss]eason\s+(\d+)\s+[Ee]pisode\s+(\d+)$',
-        r'^(.*?)\s+[Ss](\d+)[Ee](\d+)$',
-    ]
-    for pattern in series_season_episode_patterns:
-        match = re.search(pattern, text_cleaned)
-        if match:
-            raw_name = match.group(1).strip()
-            season_num = int(match.group(2))
-            episode_num = int(match.group(3))
-            clean_name_text = clean_name(raw_name)
-            return clean_name_text, 'series', season_num, episode_num
-    
-    # 3. أنماط المسلسلات مع الحلقة فقط (افتراضي الموسم 1)
-    series_episode_patterns = [
-        r'^مسلسل\s+(.*?)\s+الحلقة\s+(\d+)$',
-        r'^(.*?)\s+الحلقة\s+(\d+)$',
-        r'^(.*?)\s+[Ee]pisode\s+(\d+)$',
-        r'^(.*?)\s+ح(\d+)$',
-    ]
-    for pattern in series_episode_patterns:
-        match = re.search(pattern, text_cleaned)
-        if match:
-            raw_name = match.group(1).strip()
-            episode_num = int(match.group(2))
-            clean_name_text = clean_name(raw_name)
-            return clean_name_text, 'series', 1, episode_num
-    
-    # 4. نمط عام: اسم مع رقم في النهاية (قد يكون مسلسل أو فيلم)
-    # نحاول تحديد إذا كان فيلماً (كلمة فيلم في النص أو اسم قصير) أو مسلسل
-    # نبحث عن رقم في النهاية
-    num_at_end = extract_numbers_from_end(text_cleaned)
-    if num_at_end:
-        # إزالة الرقم من النهاية للحصول على الاسم
-        name_part = re.sub(r'[-_]?\s*\d+\s*$', '', text_cleaned).strip()
-        # إذا كان النص يحتوي على كلمة فيلم
-        if 'فيلم' in name_part.lower() or len(name_part.split()) <= 3:  # افتراض أن أسماء الأفلام قصيرة
-            # فيلم
-            season_num = num_at_end
-            clean_name_text = clean_name(name_part)
-            return clean_name_text, 'movie', season_num, 1
-        else:
-            # مسلسل
-            clean_name_text = clean_name(name_part)
-            return clean_name_text, 'series', 1, num_at_end
-    
-    # 5. محاولة أخيرة: إذا كان النص يحتوي على "فيلم" أو "مسلسل" في أي مكان
+    # ========== 4. إذا كان النص يحتوي على كلمة "فيلم" أو "مسلسل" ==========
     if 'فيلم' in text_cleaned.lower():
         # اعتبره فيلم، نحاول استخراج الرقم من النص
-        # إزالة كلمة فيلم وأخذ الباقي
         name_part = re.sub(r'فيلم\s*', '', text_cleaned, flags=re.IGNORECASE).strip()
         extracted = extract_numbers_from_end(name_part)
         if extracted:
@@ -223,6 +212,7 @@ def parse_content_info(message_text):
         else:
             season_num = 1
         clean_name_text = clean_name(name_part)
+        print(f"   ✅ تحليل (فيلم ضمني): {clean_name_text} - الجزء {season_num}")
         return clean_name_text, 'movie', season_num, 1
     
     if 'مسلسل' in text_cleaned.lower():
@@ -233,6 +223,7 @@ def parse_content_info(message_text):
             name_part = re.sub(r'الموسم\s*\d+\s*الحلقة\s*\d+', '', text_cleaned, flags=re.IGNORECASE).strip()
             name_part = re.sub(r'مسلسل\s*', '', name_part, flags=re.IGNORECASE).strip()
             clean_name_text = clean_name(name_part)
+            print(f"   ✅ تحليل (مسلسل ضمني): {clean_name_text} - الموسم {season} الحلقة {episode}")
             return clean_name_text, 'series', season, episode
         else:
             # مسلسل بدون مواصفات، افترض الموسم 1 والحلقة 1 (نحتاج رقم)
@@ -242,6 +233,7 @@ def parse_content_info(message_text):
                 name_part = re.sub(r'مسلسل\s*', '', text_cleaned, flags=re.IGNORECASE).strip()
                 name_part = re.sub(r'[-_]?\s*\d+\s*$', '', name_part).strip()
                 clean_name_text = clean_name(name_part)
+                print(f"   ✅ تحليل (مسلسل ضمني بدون موسم): {clean_name_text} - الحلقة {num}")
                 return clean_name_text, 'series', 1, num
     
     # إذا لم نتمكن من التحليل
@@ -465,6 +457,7 @@ async def sync_channel_messages(client, channel):
     
     new_count = 0
     skipped_count = 0
+    failed_parse_count = 0
     
     for msg in messages:
         if msg.id in stored_ids_set:
@@ -479,10 +472,12 @@ async def sync_channel_messages(client, channel):
                 stored_ids_set.add(msg.id)  # لتجنب التكرار في نفس الدورة
             else:
                 print(f"⚠️ فشل حفظ الرسالة {msg.id}: {msg.text[:50]}...")
+                failed_parse_count += 1
         else:
             print(f"⚠️ لم يتم تحليل الرسالة {msg.id}: {msg.text[:50]}...")
+            failed_parse_count += 1
     
-    print(f"✅ مزامنة القناة {channel.title} اكتملت: {new_count} رسالة جديدة، {skipped_count} موجودة مسبقاً.")
+    print(f"✅ مزامنة القناة {channel.title} اكتملت: {new_count} رسالة جديدة، {skipped_count} موجودة مسبقاً، {failed_parse_count} فشل تحليل.")
 
 # ==============================
 # دوال استيراد التاريخ الكامل (أكثر من 1000 رسالة)
