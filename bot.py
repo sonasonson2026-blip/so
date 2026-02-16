@@ -355,7 +355,7 @@ async def test_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ خطأ في اختبار قاعدة البيانات:\n`{str(e)[:300]}`")
 
 # ==============================
-# 4. معالجة تفاصيل المحتوى مع التقسيم إلى صفحات
+# 4. معالجة تفاصيل المحتوى مع التقسيم إلى صفحات (تم تعديلها)
 # ==============================
 async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYPE, content_id, page=1):
     """عرض تفاصيل محتوى محدد (مسلسل أو فيلم) مع دعم الصفحات"""
@@ -381,137 +381,128 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
                 """), {"series_id": content_id}).fetchall()
                 channels = [row[0] for row in result]
         
-        episodes, total_episodes, total_pages = await get_content_episodes(content_id, page)
-        
-        if not episodes:
-            item_type = "حلقات" if content_type == 'series' else "أجزاء"
-            message_text = f"*{name}*\n\n📭 لا توجد {item_type} حالياً."
-            
-            if channels:
-                message_text += f"\n\n*القنوات:* {', '.join(channels)}"
-            
-            keyboard = [[InlineKeyboardButton("⬅️ رجوع", callback_data=f"{content_type}_list")]]
-            await query.edit_message_text(
-                message_text, 
-                parse_mode='Markdown', 
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
-        
-        # تجميع الحلقات حسب الموسم (للمسلسلات) أو الجزء (للأفلام)
-        seasons = {}
-        for ep in episodes:
-            ep_id, season, ep_num, msg_id, channel_id = ep
-            if season not in seasons:
-                seasons[season] = []
-            seasons[season].append((ep_id, ep_num, msg_id, channel_id))
-        
-        # بناء الرسالة
-        item_type = "حلقات" if content_type == 'series' else "أجزاء"
+        # بناء الرسالة الأساسية
         message_text = f"*{name}*\n\n"
-        
-        if total_episodes > 0:
-            message_text += f"عدد {item_type}: {total_episodes}\n"
-            if total_pages > 1:
-                message_text += f"الصفحة {page} من {total_pages}\n"
         
         # إظهار القنوات
         if channels:
-            message_text += f"\n*القنوات:* {', '.join(channels)}\n\n"
+            message_text += f"*القنوات:* {', '.join(channels)}\n\n"
         
         keyboard = []
         
         # ============================================
-        # معالجة المسلسلات
+        # معالجة المسلسلات (عرض المواسم أولاً)
         # ============================================
         if content_type == 'series':
-            # إذا كان المسلسل له أكثر من موسم، نعرض قائمة المواسم
-            if len(seasons) > 1:
+            # جلب جميع المواسم الفريدة للمسلسل مع عدد الحلقات في كل موسم
+            with engine.connect() as conn:
+                seasons_result = conn.execute(text("""
+                    SELECT season, COUNT(*) as episode_count
+                    FROM episodes
+                    WHERE series_id = :series_id
+                    GROUP BY season
+                    ORDER BY season
+                """), {"series_id": content_id}).fetchall()
+            
+            if not seasons_result:
+                message_text += "📭 لا توجد حلقات لهذا المسلسل حالياً."
+                keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data="series_list")])
+                await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+            
+            # إذا كان هناك أكثر من موسم، نعرض قائمة المواسم
+            if len(seasons_result) > 1:
                 message_text += "اختر الموسم:"
-                for season_num in sorted(seasons.keys()):
-                    # حساب عدد الحلقات في هذا الموسم
-                    ep_count = len(seasons[season_num])
+                for season, ep_count in seasons_result:
                     keyboard.append([
                         InlineKeyboardButton(
-                            f"الموسم {season_num} ({ep_count} حلقة)",
-                            callback_data=f"season_{content_id}_{season_num}"
+                            f"الموسم {season} ({ep_count} حلقة)",
+                            callback_data=f"season_{content_id}_{season}"
                         )
                     ])
             else:
-                # إذا كان المسلسل له موسم واحد فقط، نعرض الحلقات مباشرة
-                season_num = list(seasons.keys())[0] if seasons else 1
-                season_episodes = seasons.get(season_num, [])
+                # موسم واحد فقط: نعرض حلقاته مباشرة مع دعم الصفحات
+                season = seasons_result[0][0]
+                # جلب حلقات هذا الموسم مع دعم الصفحات
+                episodes, total_episodes, total_pages = await get_content_episodes(content_id, page)
+                # تصفية الحلقات لهذا الموسم (إذا كان هناك مواسم متعددة في المستقبل)
+                season_episodes = [ep for ep in episodes if ep[1] == season]
                 
-                message_text += f"الموسم {season_num}\nاختر الحلقة:"
-                
-                # تقسيم أزرار الحلقات (5 أزرار في كل صف)
-                row_buttons = []
-                for ep_id, ep_num, msg_id, channel_id in season_episodes:
-                    row_buttons.append(
-                        InlineKeyboardButton(
-                            f"الحلقة {ep_num}",
-                            callback_data=f"ep_{ep_id}"
+                if not season_episodes:
+                    message_text += f"الموسم {season}\n📭 لا توجد حلقات في هذه الصفحة."
+                else:
+                    message_text += f"الموسم {season}\nاختر الحلقة:"
+                    # تقسيم أزرار الحلقات
+                    row_buttons = []
+                    for ep in season_episodes:
+                        ep_id, _, ep_num, _, _ = ep
+                        row_buttons.append(
+                            InlineKeyboardButton(
+                                f"الحلقة {ep_num}",
+                                callback_data=f"ep_{ep_id}"
+                            )
                         )
-                    )
-                    
-                    # كل 5 أزرار نبدأ صف جديد
-                    if len(row_buttons) == 5:
+                        if len(row_buttons) == 5:
+                            keyboard.append(row_buttons)
+                            row_buttons = []
+                    if row_buttons:
                         keyboard.append(row_buttons)
-                        row_buttons = []
-                
-                if row_buttons:
-                    keyboard.append(row_buttons)
+                    
+                    # أزرار التنقل بين الصفحات
+                    if total_pages > 1:
+                        nav_buttons = []
+                        if page > 1:
+                            nav_buttons.append(InlineKeyboardButton("⬅️ السابقة", callback_data=f"content_page_{content_id}_{page-1}"))
+                        nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="page_info"))
+                        if page < total_pages:
+                            nav_buttons.append(InlineKeyboardButton("التالية ➡️", callback_data=f"content_page_{content_id}_{page+1}"))
+                        keyboard.append(nav_buttons)
         
         # ============================================
         # معالجة الأفلام
         # ============================================
         else:  # content_type == 'movie'
-            # إذا كان الفيلم له أكثر من جزء
-            if len(seasons) > 1:
+            # جلب الأجزاء (مواسم) الفريدة للفيلم
+            with engine.connect() as conn:
+                parts_result = conn.execute(text("""
+                    SELECT season, COUNT(*) as part_count
+                    FROM episodes
+                    WHERE series_id = :series_id
+                    GROUP BY season
+                    ORDER BY season
+                """), {"series_id": content_id}).fetchall()
+            
+            if not parts_result:
+                message_text += "📭 لا توجد أجزاء لهذا الفيلم حالياً."
+                keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data="movies_list")])
+                await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+            
+            # إذا كان هناك أكثر من جزء، نعرض قائمة الأجزاء
+            if len(parts_result) > 1:
                 message_text += "اختر الجزء:"
-                for season_num in sorted(seasons.keys()):
-                    # لكل جزء (موسم) نأخذ الحلقة الأولى (والوحيدة)
-                    ep_id, ep_num, msg_id, channel_id = seasons[season_num][0]
+                for part, _ in parts_result:
+                    # نحتاج episode_id لأول حلقة في هذا الجزء (يفترض أن كل جزء له حلقة واحدة)
+                    with engine.connect() as conn:
+                        ep_id = conn.execute(text("""
+                            SELECT id FROM episodes
+                            WHERE series_id = :series_id AND season = :season
+                            ORDER BY episode_number LIMIT 1
+                        """), {"series_id": content_id, "season": part}).scalar()
                     keyboard.append([
-                        InlineKeyboardButton(
-                            f"الجزء {season_num}",
-                            callback_data=f"ep_{ep_id}"
-                        )
+                        InlineKeyboardButton(f"الجزء {part}", callback_data=f"ep_{ep_id}")
                     ])
             else:
-                # إذا كان الفيلم له جزء واحد فقط
-                season_num = list(seasons.keys())[0] if seasons else 1
-                season_episodes = seasons.get(season_num, [])
-                
-                if season_episodes:
-                    ep_id, ep_num, msg_id, channel_id = season_episodes[0]
-                    message_text += "اضغط على الزر أدناه لمشاهدة الفيلم:"
-                    keyboard = [[
-                        InlineKeyboardButton(
-                            "مشاهدة الفيلم",
-                            callback_data=f"ep_{ep_id}"
-                        )
-                    ]]
-        
-        # أزرار التنقل بين الصفحات إذا كان هناك أكثر من صفحة
-        if total_pages > 1:
-            nav_buttons = []
-            
-            if page > 1:
-                nav_buttons.append(
-                    InlineKeyboardButton("⬅️ السابقة", callback_data=f"content_page_{content_id}_{page-1}")
-                )
-            
-            nav_buttons.append(
-                InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="page_info")
-            )
-            
-            if page < total_pages:
-                nav_buttons.append(
-                    InlineKeyboardButton("التالية ➡️", callback_data=f"content_page_{content_id}_{page+1}")
-                )
-            
-            keyboard.append(nav_buttons)
+                # جزء واحد فقط: نعرضه مباشرة
+                part = parts_result[0][0]
+                with engine.connect() as conn:
+                    ep_id = conn.execute(text("""
+                        SELECT id FROM episodes
+                        WHERE series_id = :series_id AND season = :season
+                        ORDER BY episode_number LIMIT 1
+                    """), {"series_id": content_id, "season": part}).scalar()
+                message_text += "اضغط على الزر أدناه لمشاهدة الفيلم:"
+                keyboard = [[InlineKeyboardButton("مشاهدة الفيلم", callback_data=f"ep_{ep_id}")]]
         
         # أزرار التنقل الرئيسية
         keyboard.append([
