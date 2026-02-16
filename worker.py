@@ -437,7 +437,7 @@ async def check_deleted_messages(client, channel):
         print(f"❌ خطأ في التحقق من الرسائل المحذوفة في {channel.title}: {e}")
 
 # ==============================
-# دالة جديدة: مزامنة جميع رسائل القناة مع قاعدة البيانات
+# دالة مزامنة جميع رسائل القناة (آخر 1000)
 # ==============================
 async def sync_channel_messages(client, channel):
     """
@@ -483,6 +483,107 @@ async def sync_channel_messages(client, channel):
             print(f"⚠️ لم يتم تحليل الرسالة {msg.id}: {msg.text[:50]}...")
     
     print(f"✅ مزامنة القناة {channel.title} اكتملت: {new_count} رسالة جديدة، {skipped_count} موجودة مسبقاً.")
+
+# ==============================
+# دوال استيراد التاريخ الكامل (أكثر من 1000 رسالة)
+# ==============================
+async def import_missed_messages(client, channel):
+    """جلب الرسائل الفائتة (الأحدث من آخر رسالة مخزنة) من القناة."""
+    channel_id = f"@{channel.username}" if hasattr(channel, 'username') and channel.username else str(channel.id)
+    print(f"\n🔍 التحقق من الرسائل الفائتة في {channel.title}...")
+    
+    try:
+        with engine.connect() as conn:
+            # الحصول على آخر message_id مخزن لهذه القناة
+            last_msg = conn.execute(
+                text("""
+                    SELECT MAX(telegram_message_id) FROM episodes 
+                    WHERE telegram_channel_id = :channel_id
+                """),
+                {"channel_id": channel_id}
+            ).scalar()
+        
+        if last_msg is None:
+            print(f"   لا توجد رسائل مخزنة سابقة لهذه القناة. سيتم جلب آخر 100 رسالة.")
+            # جلب آخر 100 رسالة
+            messages = []
+            async for msg in client.iter_messages(channel, limit=100):
+                messages.append(msg)
+            messages.reverse()  # من الأقدم للأحدث
+        else:
+            print(f"   آخر رسالة مخزنة برقم: {last_msg}. جلب الرسائل الأحدث...")
+            # جلب الرسائل الأحدث من last_msg
+            messages = []
+            async for msg in client.iter_messages(channel, min_id=last_msg, reverse=True):
+                if msg.id > last_msg:
+                    messages.append(msg)
+        
+        if messages:
+            print(f"   تم العثور على {len(messages)} رسالة جديدة/فائتة.")
+            for msg in messages:
+                if msg.text:
+                    name, content_type, season, episode = parse_content_info(msg.text)
+                    if name and content_type and episode:
+                        save_to_database(name, content_type, season, episode, msg.id, channel_id)
+                    else:
+                        print(f"   ⚠️ لم يتم تحليل الرسالة {msg.id}: {msg.text[:50]}...")
+                else:
+                    print(f"   ⚠️ رسالة {msg.id} بدون نص.")
+        else:
+            print(f"   ✅ لا توجد رسائل فائتة.")
+            
+    except Exception as e:
+        print(f"❌ خطأ في جلب الرسائل الفائتة من {channel.title}: {e}")
+
+async def import_channel_history(client, channel):
+    """استيراد جميع الرسائل القديمة من القناة بأقدمها أولاً."""
+    print(f"\n" + "="*50)
+    print(f"📂 بدء استيراد المحتوى القديم من القناة: {channel.title}")
+    print("="*50)
+    
+    imported_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    try:
+        # جمع جميع الرسائل أولاً
+        all_messages = []
+        async for message in client.iter_messages(channel, limit=1000):
+            all_messages.append(message)
+        
+        # عكس الترتيب للحصول على الأقدم أولاً
+        all_messages.reverse()
+        
+        print(f"📊 تم جمع {len(all_messages)} رسالة للاستيراد...")
+        
+        for message in all_messages:
+            if not message.text:
+                continue
+            
+            try:
+                name, content_type, season_num, episode_num = parse_content_info(message.text)
+                if name and content_type and episode_num:
+                    channel_id = f"@{message.chat.username}" if hasattr(message.chat, 'username') and message.chat.username else str(message.chat.id)
+                    if save_to_database(name, content_type, season_num, episode_num, message.id, channel_id):
+                        imported_count += 1
+                    else:
+                        skipped_count += 1
+                else:
+                    print(f"⚠️ لم يتم تحليل الرسالة: {message.text[:50]}...")
+                    error_count += 1
+            except Exception as e:
+                print(f"❌ خطأ في معالجة الرسالة {message.id}: {e}")
+                error_count += 1
+        
+        print("="*50)
+        print(f"✅ اكتمل استيراد القناة {channel.title}!")
+        print(f"   - تم استيراد: {imported_count} عنصر جديد")
+        print(f"   - تم تخطي: {skipped_count} عنصر (موجود مسبقاً)")
+        print(f"   - فشل تحليل: {error_count} رسالة")
+        print("="*50)
+        
+    except Exception as e:
+        print(f"❌ خطأ أثناء استيراد التاريخ من {channel.title}: {e}")
 
 # ==============================
 # 5. الدالة الرئيسية لمراقبة القنوات
