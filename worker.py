@@ -93,140 +93,160 @@ def clean_name(name):
     # إزالة كلمات "مسلسل" و"فيلم" من أي مكان (إذا كانت منفصلة)
     name = re.sub(r'\s+(مسلسل|فيلم)\s+', ' ', name, flags=re.IGNORECASE)
     
+    # إزالة الأرقام في النهاية إذا كانت موجودة (مثل " - 13")
+    name = re.sub(r'\s*[-_]?\s*\d+\s*$', '', name).strip()
+    
     # تنظيف المسافات الزائدة
     name = re.sub(r'\s+', ' ', name).strip()
     
     return name
 
-def extract_numbers_from_name(name):
-    """استخراج الأرقام من الاسم (مثل 13 من 'يوم-13')"""
-    match = re.search(r'[-_]?(\d+)$', name)
+def extract_numbers_from_end(text):
+    """استخراج الرقم من نهاية النص (مثل 13 من 'يوم-13' أو 'الحلقة 13')"""
+    # البحث عن رقم في نهاية السطر (مع أو بدون واصلة)
+    match = re.search(r'[-_]?\s*(\d+)\s*$', text)
     if match:
         return int(match.group(1))
     return None
 
+def extract_season_episode(text):
+    """استخراج الموسم والحلقة من النص إذا وجدا معاً."""
+    # أنماط مختلفة للموسم والحلقة
+    patterns = [
+        # الموسم X الحلقة Y (عربي)
+        r'الموسم\s*(\d+)\s*الحلقة\s*(\d+)',
+        # season X episode Y (إنجليزي)
+        r'[Ss]eason\s*(\d+)\s*[Ee]pisode\s*(\d+)',
+        # sXeY
+        r'[Ss](\d+)[Ee](\d+)',
+        # X-Y (رقم الموسم ورقم الحلقة مفصولين بشرطة)
+        r'(\d+)[-](\d+)',
+        # الحلقة Y من الموسم X
+        r'الحلقة\s*(\d+)\s*من\s*الموسم\s*(\d+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None, None
+
 def parse_content_info(message_text):
-    """تحليل نص الرسالة لاستخراج المعلومات."""
+    """تحليل نص الرسالة لاستخراج المعلومات (محسّن)."""
     if not message_text:
         return None, None, None, None
     
     text_cleaned = message_text.strip()
+    original_text = text_cleaned  # للاحتفاظ به للتسجيل
     
-    # 1. البحث عن نمط الأفلام
-    film_pattern_dash = r'^فيلم\s+(.+?)[-_](\d+)$'
-    match = re.search(film_pattern_dash, text_cleaned, re.IGNORECASE)
-    if match:
-        content_type = 'movie'
-        raw_name = match.group(1).strip()
-        season_num = int(match.group(2))
-        episode_num = 1
-        clean_name_text = clean_name(raw_name)
-        return clean_name_text, content_type, season_num, episode_num
+    # 1. أنماط الأفلام الصريحة
+    # فيلم X الجزء Y
+    film_patterns = [
+        r'^فيلم\s+(.+?)\s+الجزء\s+(\d+)$',
+        r'^فيلم\s+(.+?)[-_](\d+)$',
+        r'^فيلم\s+(.+?)\s+(\d+)$',
+        r'^فيلم\s+(.+?)$',  # فيلم بدون رقم (افتراضي الجزء 1)
+    ]
+    for pattern in film_patterns:
+        match = re.search(pattern, text_cleaned, re.IGNORECASE)
+        if match:
+            raw_name = match.group(1).strip()
+            if len(match.groups()) >= 2:
+                season_num = int(match.group(2))
+            else:
+                # إذا لم يكن هناك رقم، حاول استخراجه من الاسم
+                extracted = extract_numbers_from_end(raw_name)
+                if extracted:
+                    raw_name = re.sub(r'[-_]?\s*\d+\s*$', '', raw_name).strip()
+                    season_num = extracted
+                else:
+                    season_num = 1
+            clean_name_text = clean_name(raw_name)
+            return clean_name_text, 'movie', season_num, 1
     
-    film_pattern_space = r'^فيلم\s+(.+?)\s+(\d+)$'
-    match = re.search(film_pattern_space, text_cleaned, re.IGNORECASE)
-    if match:
-        content_type = 'movie'
-        raw_name = match.group(1).strip()
-        season_num = int(match.group(2))
-        episode_num = 1
-        clean_name_text = clean_name(raw_name)
-        return clean_name_text, content_type, season_num, episode_num
-    
-    film_pattern_name_only = r'^فيلم\s+(.+)$'
-    match = re.search(film_pattern_name_only, text_cleaned, re.IGNORECASE)
-    if match:
-        content_type = 'movie'
-        raw_name = match.group(1).strip()
-        extracted_num = extract_numbers_from_name(raw_name)
-        if extracted_num:
-            raw_name = re.sub(r'[-_]?\d+$', '', raw_name).strip()
-            season_num = extracted_num
-        else:
-            season_num = 1
-        episode_num = 1
-        clean_name_text = clean_name(raw_name)
-        return clean_name_text, content_type, season_num, episode_num
-    
-    # 2. البحث عن نمط المسلسل مع الموسم
-    series_season_pattern = r'^(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$'
-    match = re.search(series_season_pattern, text_cleaned)
-    if match:
-        content_type = 'series'
-        raw_name = match.group(1).strip()
-        season_num = int(match.group(2))
-        episode_num = int(match.group(3))
-        clean_name_text = clean_name(raw_name)
-        return clean_name_text, content_type, season_num, episode_num
-    
-    # 3. البحث عن نمط المسلسل بدون موسم
-    series_episode_pattern = r'^(.*?)\s+الحلقة\s+(\d+)$'
-    match = re.search(series_episode_pattern, text_cleaned)
-    if match:
-        content_type = 'series'
-        raw_name = match.group(1).strip()
-        season_num = 1
-        episode_num = int(match.group(2))
-        clean_name_text = clean_name(raw_name)
-        return clean_name_text, content_type, season_num, episode_num
-    
-    # 4. البحث عن نمط بسيط
-    simple_pattern = r'^(.*?[^\d\s])\s+(\d+)$'
-    match = re.search(simple_pattern, text_cleaned)
-    if match:
-        raw_name = match.group(1).strip()
-        
-        if 'فيلم' in raw_name.lower():
-            content_type = 'movie'
+    # 2. أنماط المسلسلات الصريحة مع الموسم والحلقة
+    series_season_episode_patterns = [
+        r'^مسلسل\s+(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$',
+        r'^(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$',
+        r'^(.*?)\s+[Ss]eason\s+(\d+)\s+[Ee]pisode\s+(\d+)$',
+        r'^(.*?)\s+[Ss](\d+)[Ee](\d+)$',
+    ]
+    for pattern in series_season_episode_patterns:
+        match = re.search(pattern, text_cleaned)
+        if match:
+            raw_name = match.group(1).strip()
             season_num = int(match.group(2))
-            episode_num = 1
-        else:
-            content_type = 'series'
-            season_num = 1
+            episode_num = int(match.group(3))
+            clean_name_text = clean_name(raw_name)
+            return clean_name_text, 'series', season_num, episode_num
+    
+    # 3. أنماط المسلسلات مع الحلقة فقط (افتراضي الموسم 1)
+    series_episode_patterns = [
+        r'^مسلسل\s+(.*?)\s+الحلقة\s+(\d+)$',
+        r'^(.*?)\s+الحلقة\s+(\d+)$',
+        r'^(.*?)\s+[Ee]pisode\s+(\d+)$',
+        r'^(.*?)\s+ح(\d+)$',
+    ]
+    for pattern in series_episode_patterns:
+        match = re.search(pattern, text_cleaned)
+        if match:
+            raw_name = match.group(1).strip()
             episode_num = int(match.group(2))
-        
-        clean_name_text = clean_name(raw_name)
-        return clean_name_text, content_type, season_num, episode_num
+            clean_name_text = clean_name(raw_name)
+            return clean_name_text, 'series', 1, episode_num
     
-    # 5. نمط المسلسل العربي
-    arabic_series_pattern = r'^مسلسل\s+(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$'
-    match = re.search(arabic_series_pattern, text_cleaned, re.IGNORECASE)
-    if match:
-        content_type = 'series'
-        raw_name = match.group(1).strip()
-        season_num = int(match.group(2))
-        episode_num = int(match.group(3))
-        clean_name_text = clean_name(raw_name)
-        return clean_name_text, content_type, season_num, episode_num
+    # 4. نمط عام: اسم مع رقم في النهاية (قد يكون مسلسل أو فيلم)
+    # نحاول تحديد إذا كان فيلماً (كلمة فيلم في النص أو اسم قصير) أو مسلسل
+    # نبحث عن رقم في النهاية
+    num_at_end = extract_numbers_from_end(text_cleaned)
+    if num_at_end:
+        # إزالة الرقم من النهاية للحصول على الاسم
+        name_part = re.sub(r'[-_]?\s*\d+\s*$', '', text_cleaned).strip()
+        # إذا كان النص يحتوي على كلمة فيلم
+        if 'فيلم' in name_part.lower() or len(name_part.split()) <= 3:  # افتراض أن أسماء الأفلام قصيرة
+            # فيلم
+            season_num = num_at_end
+            clean_name_text = clean_name(name_part)
+            return clean_name_text, 'movie', season_num, 1
+        else:
+            # مسلسل
+            clean_name_text = clean_name(name_part)
+            return clean_name_text, 'series', 1, num_at_end
     
-    # 6. نمط المسلسل العربي بدون موسم
-    arabic_series_simple = r'^مسلسل\s+(.*?)\s+الحلقة\s+(\d+)$'
-    match = re.search(arabic_series_simple, text_cleaned, re.IGNORECASE)
-    if match:
-        content_type = 'series'
-        raw_name = match.group(1).strip()
-        season_num = 1
-        episode_num = int(match.group(2))
-        clean_name_text = clean_name(raw_name)
-        return clean_name_text, content_type, season_num, episode_num
-    
-    print(f"⚠️ لم يتم التعرف على النمط للنص: {text_cleaned}")
-    
-    # محاولة أخيرة: إذا كان النص يحتوي على "فيلم" في البداية
-    if text_cleaned.lower().startswith('فيلم'):
-        content_type = 'movie'
-        raw_name = text_cleaned[4:].strip()
-        extracted_num = extract_numbers_from_name(raw_name)
-        if extracted_num:
-            raw_name = re.sub(r'[-_]?\d+$', '', raw_name).strip()
-            season_num = extracted_num
+    # 5. محاولة أخيرة: إذا كان النص يحتوي على "فيلم" أو "مسلسل" في أي مكان
+    if 'فيلم' in text_cleaned.lower():
+        # اعتبره فيلم، نحاول استخراج الرقم من النص
+        # إزالة كلمة فيلم وأخذ الباقي
+        name_part = re.sub(r'فيلم\s*', '', text_cleaned, flags=re.IGNORECASE).strip()
+        extracted = extract_numbers_from_end(name_part)
+        if extracted:
+            name_part = re.sub(r'[-_]?\s*\d+\s*$', '', name_part).strip()
+            season_num = extracted
         else:
             season_num = 1
-        episode_num = 1
-        clean_name_text = clean_name(raw_name)
-        print(f"   ⚠️ معالجة كفيلم افتراضي: {clean_name_text}")
-        return clean_name_text, content_type, season_num, episode_num
+        clean_name_text = clean_name(name_part)
+        return clean_name_text, 'movie', season_num, 1
     
+    if 'مسلسل' in text_cleaned.lower():
+        # اعتبره مسلسل، نحاول استخراج الموسم والحلقة
+        season, episode = extract_season_episode(text_cleaned)
+        if season and episode:
+            # إزالة الموسم والحلقة من النص للحصول على الاسم
+            name_part = re.sub(r'الموسم\s*\d+\s*الحلقة\s*\d+', '', text_cleaned, flags=re.IGNORECASE).strip()
+            name_part = re.sub(r'مسلسل\s*', '', name_part, flags=re.IGNORECASE).strip()
+            clean_name_text = clean_name(name_part)
+            return clean_name_text, 'series', season, episode
+        else:
+            # مسلسل بدون مواصفات، افترض الموسم 1 والحلقة 1 (نحتاج رقم)
+            # حاول استخراج رقم من النهاية
+            num = extract_numbers_from_end(text_cleaned)
+            if num:
+                name_part = re.sub(r'مسلسل\s*', '', text_cleaned, flags=re.IGNORECASE).strip()
+                name_part = re.sub(r'[-_]?\s*\d+\s*$', '', name_part).strip()
+                clean_name_text = clean_name(name_part)
+                return clean_name_text, 'series', 1, num
+    
+    # إذا لم نتمكن من التحليل
+    print(f"⚠️ لم يتم التعرف على النمط للنص: {original_text}")
     return None, None, None, None
 
 async def get_channel_entity(client, channel_input):
@@ -417,9 +437,54 @@ async def check_deleted_messages(client, channel):
     except Exception as e:
         print(f"❌ خطأ في التحقق من الرسائل المحذوفة في {channel.title}: {e}")
 
-# ==============================
-# 5. استيراد المسلسلات القديمة
-# ==============================
+async def import_missed_messages(client, channel):
+    """جلب الرسائل الفائتة (الأحدث من آخر رسالة مخزنة) من القناة."""
+    channel_id = f"@{channel.username}" if hasattr(channel, 'username') and channel.username else str(channel.id)
+    print(f"\n🔍 التحقق من الرسائل الفائتة في {channel.title}...")
+    
+    try:
+        with engine.connect() as conn:
+            # الحصول على آخر message_id مخزن لهذه القناة
+            last_msg = conn.execute(
+                text("""
+                    SELECT MAX(telegram_message_id) FROM episodes 
+                    WHERE telegram_channel_id = :channel_id
+                """),
+                {"channel_id": channel_id}
+            ).scalar()
+        
+        if last_msg is None:
+            print(f"   لا توجد رسائل مخزنة سابقة لهذه القناة. سيتم جلب آخر 100 رسالة.")
+            # جلب آخر 100 رسالة
+            messages = []
+            async for msg in client.iter_messages(channel, limit=100):
+                messages.append(msg)
+            messages.reverse()  # من الأقدم للأحدث
+        else:
+            print(f"   آخر رسالة مخزنة برقم: {last_msg}. جلب الرسائل الأحدث...")
+            # جلب الرسائل الأحدث من last_msg
+            messages = []
+            async for msg in client.iter_messages(channel, min_id=last_msg, reverse=True):
+                if msg.id > last_msg:
+                    messages.append(msg)
+        
+        if messages:
+            print(f"   تم العثور على {len(messages)} رسالة جديدة/فائتة.")
+            for msg in messages:
+                if msg.text:
+                    name, content_type, season, episode = parse_content_info(msg.text)
+                    if name and content_type and episode:
+                        save_to_database(name, content_type, season, episode, msg.id, channel_id)
+                    else:
+                        print(f"   ⚠️ لم يتم تحليل الرسالة {msg.id}: {msg.text[:50]}...")
+                else:
+                    print(f"   ⚠️ رسالة {msg.id} بدون نص.")
+        else:
+            print(f"   ✅ لا توجد رسائل فائتة.")
+            
+    except Exception as e:
+        print(f"❌ خطأ في جلب الرسائل الفائتة من {channel.title}: {e}")
+
 async def import_channel_history(client, channel):
     """استيراد جميع الرسائل القديمة من القناة بأقدمها أولاً."""
     print(f"\n" + "="*50)
@@ -471,7 +536,7 @@ async def import_channel_history(client, channel):
         print(f"❌ خطأ أثناء استيراد التاريخ من {channel.title}: {e}")
 
 # ==============================
-# 6. الدالة الرئيسية لمراقبة القنوات
+# 5. الدالة الرئيسية لمراقبة القنوات
 # ==============================
 async def monitor_channels():
     """الدالة الرئيسية لمراقبة عدة قنوات."""
@@ -509,7 +574,10 @@ async def monitor_channels():
             for channel in channel_entities:
                 await import_channel_history(client, channel)
         else:
-            print("⚠️ استيراد المحتوى القديم معطل.")
+            print("⚠️ استيراد المحتوى القديم معطل. سيتم جلب الرسائل الفائتة فقط.")
+            # جلب الرسائل الفائتة لكل قناة
+            for channel in channel_entities:
+                await import_missed_messages(client, channel)
         
         # التحقق من الرسائل المحذوفة إذا كان مفعلاً
         if CHECK_DELETED_MESSAGES:
@@ -535,6 +603,8 @@ async def monitor_channels():
                     # إضافة معرف القناة في قاعدة البيانات
                     channel_id = f"@{message.chat.username}" if hasattr(message.chat, 'username') and message.chat.username else str(message.chat.id)
                     save_to_database(name, content_type, season_num, episode_num, message.id, channel_id)
+                else:
+                    print(f"   ⚠️ لم يتم التعرف على المحتوى في الرسالة.")
         
         # مراقبة حذف الرسائل من جميع القنوات
         @client.on(events.MessageDeleted(chats=channel_entities))
@@ -559,7 +629,7 @@ async def monitor_channels():
         print("🛑 تم إيقاف مراقبة القنوات.")
 
 # ==============================
-# 7. نقطة دخول البرنامج
+# 6. نقطة دخول البرنامج
 # ==============================
 if __name__ == "__main__":
     print("🚀 بدء تشغيل Worker لمراقبة قنوات المسلسلات والأفلام...")
