@@ -720,7 +720,48 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"خطأ في button_handler: {e}", exc_info=True)
         await query.edit_message_text("⚠️ حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.")
-
+# ==============================
+#
+# ==============================
+async def debug_all_episodes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض جميع حلقات مسلسل معين (للتشخيص)."""
+    if not context.args:
+        await update.message.reply_text("استخدم: /debug_all_episodes <series_id>")
+        return
+    try:
+        series_id = int(context.args[0])
+        with engine.connect() as conn:
+            # جلب جميع الحلقات مرتبة حسب الموسم ورقم الحلقة
+            episodes = conn.execute(
+                text("""
+                    SELECT season, episode_number
+                    FROM episodes
+                    WHERE series_id = :sid
+                    ORDER BY season, episode_number
+                """),
+                {"sid": series_id}
+            ).fetchall()
+            if not episodes:
+                await update.message.reply_text("لا توجد حلقات لهذا المسلسل.")
+                return
+            # تجميع النتائج
+            result = {}
+            for season, ep in episodes:
+                if season not in result:
+                    result[season] = []
+                result[season].append(ep)
+            text = f"📊 جميع حلقات المسلسل {series_id}:\n\n"
+            for season in sorted(result.keys()):
+                eps = result[season]
+                text += f"الموسم {season}: {len(eps)} حلقة (من {min(eps)} إلى {max(eps)})\n"
+                # عرض أول 20 رقم للموسم
+                text += f"  الأرقام: {', '.join(map(str, eps[:20]))}"
+                if len(eps) > 20:
+                    text += f"... (و{len(eps)-20} أخرى)"
+                text += "\n\n"
+            await update.message.reply_text(text, parse_mode='HTML')
+    except Exception as e:
+        await update.message.reply_text(f"خطأ: {e}")
 # ==============================
 # 10. الدالة الرئيسية
 # ==============================
@@ -736,6 +777,7 @@ def main():
         app.add_handler(CommandHandler("debug_movies", debug_movies))
         app.add_handler(CommandHandler("find", find_series))
         app.add_handler(CommandHandler("debug_season", debug_season))
+        app.add_handler(CommandHandler("debug_all_episodes", debug_all_episodes))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("🤖 البوت يعمل...")
