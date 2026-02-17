@@ -177,12 +177,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /series - عرض المسلسلات
 /movies - عرض الأفلام
 /all - عرض كل المحتويات
-/test - اختبار قاعدة البيانات
-/debug - فحص تفاصيل مسلسل/فيلم
-/debug_movies - عرض قائمة الأفلام مع المعرفات
-/find &lt;كلمة&gt; - البحث عن مسلسل/فيلم بالاسم
-/debug_season &lt;id&gt; &lt;موسم&gt; - تشخيص حلقات موسم
-/debug_all_episodes &lt;id&gt; - عرض جميع حلقات مسلسل
         """
 
         if update.callback_query:
@@ -285,34 +279,6 @@ async def movies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_content(update, context)
-
-async def test_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر /test - اختبار قاعدة البيانات."""
-    try:
-        if not engine:
-            await update.message.reply_text("❌ قاعدة البيانات غير متصلة.")
-            return
-
-        with engine.connect() as conn:
-            tables = conn.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")).fetchall()
-            tables_info = "📋 <b>الجداول الموجودة:</b>\n"
-            for table in tables:
-                count = conn.execute(text(f"SELECT COUNT(*) FROM {table[0]}")).scalar()
-                tables_info += f"• <code>{table[0]}</code>: {count} صف\n"
-            series_sample = conn.execute(text("SELECT id, name, type FROM series ORDER BY id LIMIT 5")).fetchall()
-            episodes_sample = conn.execute(text("SELECT id, series_id, season, episode_number, telegram_channel_id FROM episodes ORDER BY id LIMIT 5")).fetchall()
-            series_text = "🎬 <b>عينة من المسلسلات والأفلام:</b>\n"
-            for row in series_sample:
-                series_text += f"• ID:{row[0]} - {row[1]} ({row[2]})\n"
-            episodes_text = "📺 <b>عينة من الحلقات:</b>\n"
-            for row in episodes_sample:
-                episodes_text += f"• ID:{row[0]} - مسلسل:{row[1]} - م{row[2]} ح{row[3]} - قناة:{row[4]}\n"
-            reply_text = f"{tables_info}\n{series_text}\n{episodes_text}"
-
-        await update.message.reply_text(reply_text, parse_mode='HTML')
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطأ في اختبار قاعدة البيانات:\n<code>{str(e)[:300]}</code>")
 
 # ==============================
 # 4. عرض تفاصيل المحتوى (مواسم/أجزاء)
@@ -506,162 +472,7 @@ async def show_episode_details(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("⚠️ حدث خطأ أثناء جلب المعلومات.")
 
 # ==============================
-# 7. أوامر التصحيح (debug)
-# ==============================
-async def debug_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض تفاصيل مسلسل/فيلم محدد (للتشخيص)."""
-    try:
-        if not context.args:
-            await update.message.reply_text("استخدم: /debug <معرف المسلسل>")
-            return
-        series_id = int(context.args[0])
-
-        with engine.connect() as conn:
-            series = conn.execute(text("SELECT id, name, type FROM series WHERE id = :id"), {"id": series_id}).fetchone()
-            if not series:
-                await update.message.reply_text("المسلسل غير موجود")
-                return
-
-            episodes = conn.execute(text("""
-                SELECT season, COUNT(*) as count, MIN(episode_number) as min_ep, MAX(episode_number) as max_ep
-                FROM episodes WHERE series_id = :sid GROUP BY season ORDER BY season
-            """), {"sid": series_id}).fetchall()
-
-            text = f"<b>{series[1]}</b> (ID: {series[0]}, نوع: {series[2]})\n"
-            for ep in episodes:
-                text += f"• الموسم {ep[0]}: {ep[1]} حلقة (من {ep[2]} إلى {ep[3]})\n"
-
-            total = conn.execute(text("SELECT COUNT(*) FROM episodes WHERE series_id = :sid"), {"sid": series_id}).scalar()
-            text += f"\nإجمالي الحلقات: {total}"
-
-            await update.message.reply_text(text, parse_mode='HTML')
-    except Exception as e:
-        await update.message.reply_text(f"خطأ: {e}")
-
-async def debug_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض قائمة الأفلام مع معرفاتها."""
-    try:
-        with engine.connect() as conn:
-            movies = conn.execute(text("SELECT id, name FROM series WHERE type = 'movie' ORDER BY name")).fetchall()
-            if not movies:
-                await update.message.reply_text("لا توجد أفلام")
-                return
-
-            text = "🎬 <b>قائمة الأفلام (مع المعرفات):</b>\n"
-            for m in movies:
-                text += f"• {m[1]} – معرف <code>{m[0]}</code>\n"
-            await update.message.reply_text(text, parse_mode='HTML')
-    except Exception as e:
-        await update.message.reply_text(f"خطأ: {e}")
-
-async def find_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """البحث عن مسلسلات أو أفلام بالاسم."""
-    if not context.args:
-        await update.message.reply_text("استخدم: /find <كلمة>")
-        return
-    search_term = ' '.join(context.args)
-    try:
-        with engine.connect() as conn:
-            results = conn.execute(
-                text("""
-                    SELECT s.id, s.name, s.type, s.normalized_name, 
-                           COUNT(e.id) as episode_count
-                    FROM series s
-                    LEFT JOIN episodes e ON s.id = e.series_id
-                    WHERE s.name ILIKE :pattern OR s.normalized_name ILIKE :pattern
-                    GROUP BY s.id, s.name, s.type, s.normalized_name
-                """),
-                {"pattern": f"%{search_term}%"}
-            ).fetchall()
-            if not results:
-                await update.message.reply_text(f"لا توجد نتائج لـ '{search_term}'")
-                return
-            response = f"🔍 نتائج البحث عن '{search_term}':\n\n"
-            for r in results:
-                response += f"• {r[1]} (ID: {r[0]}, نوع: {r[2]}, مقيس: {r[3]}, عدد الحلقات: {r[4]})\n"
-            await update.message.reply_text(response)
-    except Exception as e:
-        await update.message.reply_text(f"خطأ: {e}")
-
-async def debug_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تشخيص عدد حلقات موسم معين."""
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("استخدم: /debug_season <series_id> <season>")
-        return
-    try:
-        series_id = int(context.args[0])
-        season = int(context.args[1])
-        with engine.connect() as conn:
-            # عدد الحلقات في الموسم
-            count = conn.execute(
-                text("SELECT COUNT(*) FROM episodes WHERE series_id = :sid AND season = :season"),
-                {"sid": series_id, "season": season}
-            ).scalar()
-            # عينة من الحلقات
-            episodes = conn.execute(
-                text("SELECT episode_number, telegram_message_id, telegram_channel_id, added_at FROM episodes WHERE series_id = :sid AND season = :season ORDER BY episode_number"),
-                {"sid": series_id, "season": season}
-            ).fetchall()
-            if count == 0:
-                await update.message.reply_text(f"لا توجد حلقات للمسلسل {series_id} في الموسم {season}")
-                return
-            # أرقام الحلقات
-            ep_numbers = [ep[0] for ep in episodes]
-            min_ep = min(ep_numbers)
-            max_ep = max(ep_numbers)
-            msg = f"🔍 <b>المسلسل ID {series_id} - الموسم {season}</b>\n"
-            msg += f"إجمالي الحلقات: {count}\n"
-            msg += f"أصغر رقم حلقة: {min_ep}\n"
-            msg += f"أكبر رقم حلقة: {max_ep}\n"
-            msg += f"أول 20 رقم: {', '.join(map(str, ep_numbers[:20]))}"
-            if len(ep_numbers) > 20:
-                msg += f"... (و{len(ep_numbers)-20} أخرى)"
-            await update.message.reply_text(msg, parse_mode='HTML')
-    except Exception as e:
-        await update.message.reply_text(f"خطأ: {e}")
-
-async def debug_all_episodes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض جميع حلقات مسلسل معين (للتشخيص)."""
-    if not context.args:
-        await update.message.reply_text("استخدم: /debug_all_episodes <series_id>")
-        return
-    try:
-        series_id = int(context.args[0])
-        with engine.connect() as conn:
-            # جلب جميع الحلقات مرتبة حسب الموسم ورقم الحلقة
-            episodes = conn.execute(
-                text("""
-                    SELECT season, episode_number
-                    FROM episodes
-                    WHERE series_id = :sid
-                    ORDER BY season, episode_number
-                """),
-                {"sid": series_id}
-            ).fetchall()
-            if not episodes:
-                await update.message.reply_text("لا توجد حلقات لهذا المسلسل.")
-                return
-            # تجميع النتائج
-            result = {}
-            for season, ep in episodes:
-                if season not in result:
-                    result[season] = []
-                result[season].append(ep)
-            response = f"📊 جميع حلقات المسلسل {series_id}:\n\n"
-            for season in sorted(result.keys()):
-                eps = result[season]
-                response += f"الموسم {season}: {len(eps)} حلقة (من {min(eps)} إلى {max(eps)})\n"
-                # عرض أول 20 رقم للموسم
-                response += f"  الأرقام: {', '.join(map(str, eps[:20]))}"
-                if len(eps) > 20:
-                    response += f"... (و{len(eps)-20} أخرى)"
-                response += "\n\n"
-            await update.message.reply_text(response, parse_mode='HTML')
-    except Exception as e:
-        await update.message.reply_text(f"خطأ: {e}")
-
-# ==============================
-# 8. اختبار قاعدة البيانات من الزر
+# 7. اختبار قاعدة البيانات من الزر (يبقى مفيداً)
 # ==============================
 async def test_db_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """اختبار قاعدة البيانات من الزر."""
@@ -697,7 +508,7 @@ async def test_db_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ خطأ في الاختبار: {str(e)[:200]}")
 
 # ==============================
-# 9. معالج الأزرار التفاعلية
+# 8. معالج الأزرار التفاعلية
 # ==============================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة جميع أزرار InlineKeyboard."""
@@ -764,7 +575,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.")
 
 # ==============================
-# 10. الدالة الرئيسية
+# 9. الدالة الرئيسية
 # ==============================
 def main():
     try:
@@ -773,12 +584,7 @@ def main():
         app.add_handler(CommandHandler("series", series_command))
         app.add_handler(CommandHandler("movies", movies_command))
         app.add_handler(CommandHandler("all", all_command))
-        app.add_handler(CommandHandler("test", test_db_command))
-        app.add_handler(CommandHandler("debug", debug_series))
-        app.add_handler(CommandHandler("debug_movies", debug_movies))
-        app.add_handler(CommandHandler("find", find_series))
-        app.add_handler(CommandHandler("debug_season", debug_season))
-        app.add_handler(CommandHandler("debug_all_episodes", debug_all_episodes))
+        # تم إزالة أوامر التصحيح: test, debug, find, debug_season, debug_all_episodes
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("🤖 البوت يعمل...")
@@ -786,7 +592,6 @@ def main():
         app.run_polling(poll_interval=1.0, timeout=30, drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         print(f"❌ خطأ فادح: {e}")
-        # لا نعيد الاستدعاء لتجنب حلقة لا نهائية
 
 if __name__ == "__main__":
     main()
