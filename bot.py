@@ -570,16 +570,24 @@ async def find_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_term = ' '.join(context.args)
     try:
         with engine.connect() as conn:
+            # جلب المسلسلات مع عدد الحلقات
             results = conn.execute(
-                text("SELECT id, name, type, normalized_name FROM series WHERE name ILIKE :pattern OR normalized_name ILIKE :pattern"),
+                text("""
+                    SELECT s.id, s.name, s.type, s.normalized_name, 
+                           COUNT(e.id) as episode_count
+                    FROM series s
+                    LEFT JOIN episodes e ON s.id = e.series_id
+                    WHERE s.name ILIKE :pattern OR s.normalized_name ILIKE :pattern
+                    GROUP BY s.id, s.name, s.type, s.normalized_name
+                """),
                 {"pattern": f"%{search_term}%"}
             ).fetchall()
             if not results:
                 await update.message.reply_text(f"لا توجد نتائج لـ '{search_term}'")
                 return
-            response = f"نتائج البحث عن '{search_term}':\n\n"
+            response = f"🔍 نتائج البحث عن '{search_term}':\n\n"
             for r in results:
-                response += f"• {r[1]} (ID: {r[0]}, نوع: {r[2]}, مقيس: {r[3]})\n"
+                response += f"• {r[1]} (ID: {r[0]}, نوع: {r[2]}, مقيس: {r[3]}, عدد الحلقات: {r[4]})\n"
             await update.message.reply_text(response)
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
