@@ -25,10 +25,10 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# إعداد التسجيل - رفع المستوى إلى DEBUG للتشخيص
+# إعداد التسجيل
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG  # يمكنك إعادته إلى INFO بعد التشخيص
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ engine = None
 if DATABASE_URL:
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
-        # اختبار الاتصال
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         print("✅ تم الاتصال بقاعدة البيانات بنجاح.")
@@ -46,7 +45,7 @@ if DATABASE_URL:
         engine = None
 
 # ==============================
-# 2. دوال المساعدة لجلب البيانات (مرتبة حسب الأحدث في الأسفل)
+# 2. دوال المساعدة لجلب البيانات
 # ==============================
 async def get_all_content(content_type=None):
     """جلب جميع المحتويات مع ترتيبها بحيث الأحدث في الأسفل."""
@@ -70,7 +69,6 @@ async def get_all_content(content_type=None):
             """
             result = conn.execute(text(query))
             rows = result.fetchall()
-            logger.debug(f"get_all_content: تم جلب {len(rows)} صف (النوع: {content_type})")
             return rows
     except Exception as e:
         logger.error(f"خطأ في جلب المحتويات: {e}")
@@ -85,15 +83,13 @@ async def get_content_info(series_id):
             result = conn.execute(text("""
                 SELECT id, name, type FROM series WHERE id = :series_id
             """), {"series_id": series_id})
-            row = result.fetchone()
-            logger.debug(f"get_content_info: {series_id} -> {row}")
-            return row
+            return result.fetchone()
     except Exception as e:
         logger.error(f"خطأ في جلب معلومات المحتوى {series_id}: {e}")
         return None
 
 async def get_season_episodes(series_id, season, page=1, per_page=50):
-    """جلب حلقات موسم محدد مع دعم الصفحات، مرتبة حسب رقم الحلقة (تصاعدي)."""
+    """جلب حلقات موسم محدد مع دعم الصفحات."""
     if not engine:
         return [], 0, 0, page
     try:
@@ -104,7 +100,6 @@ async def get_season_episodes(series_id, season, page=1, per_page=50):
                 WHERE series_id = :series_id AND season = :season
             """), {"series_id": series_id, "season": season})
             total_episodes = count_result.scalar()
-            logger.debug(f"get_season_episodes: series_id={series_id}, season={season}, total={total_episodes}")
 
             total_pages = (total_episodes + per_page - 1) // per_page if total_episodes > 0 else 0
 
@@ -115,6 +110,7 @@ async def get_season_episodes(series_id, season, page=1, per_page=50):
 
             offset = (page - 1) * per_page
 
+            # جلب الحلقات مع ترتيب تصاعدي حسب رقم الحلقة
             result = conn.execute(text("""
                 SELECT e.id, e.season, e.episode_number, 
                        e.telegram_message_id, e.telegram_channel_id
@@ -130,7 +126,6 @@ async def get_season_episodes(series_id, season, page=1, per_page=50):
             })
 
             episodes = result.fetchall()
-            logger.debug(f"get_season_episodes: تم جلب {len(episodes)} حلقة للصفحة {page}")
             return episodes, total_episodes, total_pages, page
     except Exception as e:
         logger.error(f"خطأ في get_season_episodes: {e}")
@@ -149,9 +144,7 @@ async def get_movie_parts(series_id):
                 GROUP BY season
                 ORDER BY season ASC
             """), {"series_id": series_id})
-            rows = result.fetchall()
-            logger.debug(f"get_movie_parts: series_id={series_id}, parts={rows}")
-            return rows
+            return result.fetchall()
     except Exception as e:
         logger.error(f"خطأ في get_movie_parts: {e}")
         return []
@@ -188,7 +181,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /debug - فحص تفاصيل مسلسل/فيلم
 /debug_movies - عرض قائمة الأفلام مع المعرفات
 /find &lt;كلمة&gt; - البحث عن مسلسل/فيلم بالاسم
-"""
+/debug_season &lt;id&gt; &lt;موسم&gt; - تشخيص حلقات موسم
+        """
 
         if update.callback_query:
             await update.callback_query.edit_message_text(
@@ -352,7 +346,6 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
                     GROUP BY season
                     ORDER BY season
                 """), {"series_id": content_id}).fetchall()
-            logger.info(f"show_content_details: مسلسل {name} (ID:{content_id}) - المواسم: {seasons}")
             if not seasons:
                 message_text += "📭 لا توجد حلقات لهذا المسلسل حالياً."
                 keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data="series_list")])
@@ -363,13 +356,11 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
                 for s, cnt in seasons:
                     keyboard.append([InlineKeyboardButton(f"الموسم {s} ({cnt} حلقة)", callback_data=f"season_{content_id}_{s}")])
             else:
-                # موسم واحد فقط: نوجه إلى عرض الحلقات
                 season = seasons[0][0]
                 await show_season_episodes(update, context, content_id, season, page)
                 return
         else:  # movie
             parts = await get_movie_parts(content_id)
-            logger.info(f"show_content_details: فيلم {name} (ID:{content_id}) - الأجزاء: {parts}")
             if not parts:
                 message_text += "📭 لا توجد أجزاء لهذا الفيلم حالياً."
                 keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data="movies_list")])
@@ -570,7 +561,6 @@ async def find_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_term = ' '.join(context.args)
     try:
         with engine.connect() as conn:
-            # جلب المسلسلات مع عدد الحلقات
             results = conn.execute(
                 text("""
                     SELECT s.id, s.name, s.type, s.normalized_name, 
@@ -589,6 +579,43 @@ async def find_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for r in results:
                 response += f"• {r[1]} (ID: {r[0]}, نوع: {r[2]}, مقيس: {r[3]}, عدد الحلقات: {r[4]})\n"
             await update.message.reply_text(response)
+    except Exception as e:
+        await update.message.reply_text(f"خطأ: {e}")
+
+async def debug_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تشخيص عدد حلقات موسم معين."""
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("استخدم: /debug_season <series_id> <season>")
+        return
+    try:
+        series_id = int(context.args[0])
+        season = int(context.args[1])
+        with engine.connect() as conn:
+            # عدد الحلقات في الموسم
+            count = conn.execute(
+                text("SELECT COUNT(*) FROM episodes WHERE series_id = :sid AND season = :season"),
+                {"sid": series_id, "season": season}
+            ).scalar()
+            # عينة من الحلقات
+            episodes = conn.execute(
+                text("SELECT episode_number, telegram_message_id, telegram_channel_id, added_at FROM episodes WHERE series_id = :sid AND season = :season ORDER BY episode_number"),
+                {"sid": series_id, "season": season}
+            ).fetchall()
+            if count == 0:
+                await update.message.reply_text(f"لا توجد حلقات للمسلسل {series_id} في الموسم {season}")
+                return
+            # أرقام الحلقات
+            ep_numbers = [ep[0] for ep in episodes]
+            min_ep = min(ep_numbers)
+            max_ep = max(ep_numbers)
+            text = f"🔍 <b>المسلسل ID {series_id} - الموسم {season}</b>\n"
+            text += f"إجمالي الحلقات: {count}\n"
+            text += f"أصغر رقم حلقة: {min_ep}\n"
+            text += f"أكبر رقم حلقة: {max_ep}\n"
+            text += f"أول 20 رقم: {', '.join(map(str, ep_numbers[:20]))}"
+            if len(ep_numbers) > 20:
+                text += f"... (و{len(ep_numbers)-20} أخرى)"
+            await update.message.reply_text(text, parse_mode='HTML')
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
 
@@ -696,47 +723,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.")
 
 # ==============================
-async def debug_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تشخيص عدد حلقات موسم معين."""
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("استخدم: /debug_season <series_id> <season>")
-        return
-    try:
-        series_id = int(context.args[0])
-        season = int(context.args[1])
-        with engine.connect() as conn:
-            # عدد الحلقات في الموسم
-            count = conn.execute(
-                text("SELECT COUNT(*) FROM episodes WHERE series_id = :sid AND season = :season"),
-                {"sid": series_id, "season": season}
-            ).scalar()
-            # عينة من الحلقات
-            episodes = conn.execute(
-                text("SELECT episode_number, telegram_message_id, telegram_channel_id, added_at FROM episodes WHERE series_id = :sid AND season = :season ORDER BY episode_number"),
-                {"sid": series_id, "season": season}
-            ).fetchall()
-            if count == 0:
-                await update.message.reply_text(f"لا توجد حلقات للمسلسل {series_id} في الموسم {season}")
-                return
-            # أرقام الحلقات
-            ep_numbers = [ep[0] for ep in episodes]
-            min_ep = min(ep_numbers)
-            max_ep = max(ep_numbers)
-            text = f"🔍 **المسلسل ID {series_id} - الموسم {season}**\n"
-            text += f"إجمالي الحلقات: {count}\n"
-            text += f"أصغر رقم حلقة: {min_ep}\n"
-            text += f"أكبر رقم حلقة: {max_ep}\n"
-            text += f"أول 20 رقم: {', '.join(map(str, ep_numbers[:20]))}"
-            if len(ep_numbers) > 20:
-                text += f"... (و{len(ep_numbers)-20} أخرى)"
-            await update.message.reply_text(text, parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text(f"خطأ: {e}")
 # 10. الدالة الرئيسية
 # ==============================
 def main():
     try:
-        app.add_handler(CommandHandler("debug_season", debug_season))
         app = Application.builder().token(BOT_TOKEN).build()
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("series", series_command))
@@ -746,6 +736,7 @@ def main():
         app.add_handler(CommandHandler("debug", debug_series))
         app.add_handler(CommandHandler("debug_movies", debug_movies))
         app.add_handler(CommandHandler("find", find_series))
+        app.add_handler(CommandHandler("debug_season", debug_season))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("🤖 البوت يعمل...")
@@ -753,9 +744,7 @@ def main():
         app.run_polling(poll_interval=1.0, timeout=30, drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         print(f"❌ خطأ فادح: {e}")
-        import time
-        time.sleep(5)
-        main()
+        # لا نعيد الاستدعاء لتجنب حلقة لا نهائية
 
 if __name__ == "__main__":
     main()
