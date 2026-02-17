@@ -28,7 +28,7 @@ if DATABASE_URL.startswith("postgres://"):
 # إعداد التسجيل - رفع المستوى إلى DEBUG للتشخيص
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG  # تغيير مؤقت للتشخيص
+    level=logging.DEBUG  # يمكنك إعادته إلى INFO بعد التشخيص
 )
 logger = logging.getLogger(__name__)
 
@@ -187,6 +187,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /test - اختبار قاعدة البيانات
 /debug - فحص تفاصيل مسلسل/فيلم
 /debug_movies - عرض قائمة الأفلام مع المعرفات
+/find <كلمة> - البحث عن مسلسل/فيلم بالاسم
         """
 
         if update.callback_query:
@@ -561,6 +562,28 @@ async def debug_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
 
+async def find_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """البحث عن مسلسلات أو أفلام بالاسم."""
+    if not context.args:
+        await update.message.reply_text("استخدم: /find <كلمة البحث>")
+        return
+    search_term = ' '.join(context.args)
+    try:
+        with engine.connect() as conn:
+            results = conn.execute(
+                text("SELECT id, name, type, normalized_name FROM series WHERE name ILIKE :pattern OR normalized_name ILIKE :pattern"),
+                {"pattern": f"%{search_term}%"}
+            ).fetchall()
+            if not results:
+                await update.message.reply_text(f"لا توجد نتائج لـ '{search_term}'")
+                return
+            text = f"نتائج البحث عن '{search_term}':\n\n"
+            for r in results:
+                text += f"• {r[1]} (ID: {r[0]}, نوع: {r[2]}, مقيس: {r[3]})\n"
+            await update.message.reply_text(text)
+    except Exception as e:
+        await update.message.reply_text(f"خطأ: {e}")
+
 # ==============================
 # 8. اختبار قاعدة البيانات من الزر
 # ==============================
@@ -677,6 +700,7 @@ def main():
         app.add_handler(CommandHandler("test", test_db_command))
         app.add_handler(CommandHandler("debug", debug_series))
         app.add_handler(CommandHandler("debug_movies", debug_movies))
+        app.add_handler(CommandHandler("find", find_series))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("🤖 البوت يعمل...")
