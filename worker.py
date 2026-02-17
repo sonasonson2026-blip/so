@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 # ==============================
-# 1. إعدادات التهيئة من متغيرات البيئة
+# 1. إعدادات التهيئة من متغيرات 
 # ==============================
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
