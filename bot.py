@@ -61,7 +61,7 @@ async def get_all_content(content_type=None):
                 query += f" WHERE s.type = '{content_type}'"
             query += """
                 GROUP BY s.id, s.name, s.type
-                ORDER BY last_msg_id ASC NULLS LAST
+                ORDER BY last_msg_id DESC NULLS LAST
             """
             result = conn.execute(text(query))
             return result.fetchall()
