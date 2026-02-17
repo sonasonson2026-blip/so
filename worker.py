@@ -4,6 +4,7 @@ import re
 import sys
 import logging
 import unicodedata
+from collections import defaultdict
 from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -116,7 +117,7 @@ with engine.begin() as conn:
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_added_at ON episodes(added_at)"))
 logger.info("✅ تم إنشاء الجداول.")
 
-# تحديث الأسماء المقيسة (إذا وجدت بيانات سابقة)
+# تحديث الأسماء المقيسة للصفوف القديمة
 with engine.begin() as conn:
     rows = conn.execute(text("SELECT id, name FROM series WHERE normalized_name IS NULL")).fetchall()
     for row in rows:
@@ -126,122 +127,137 @@ with engine.begin() as conn:
         logger.info(f"✅ تم تحديث {len(rows)} اسماً مقيساً.")
 
 # ==============================
-# 5. دوال التحليل (الكاملة)
+# 5. سياق المسلسلات لكل قناة (للبوستات التعريفية)
 # ==============================
-def parse_content_info(message_text):
-    """تحليل نص الرسالة لاستخراج المعلومات (محسّن جداً)."""
+# تخزين آخر اسم مسلسل تم رصده من بوست نصي (بدون فيديو) لكل قناة
+series_context = defaultdict(lambda: None)
+
+# ==============================
+# 6. دالة التحليل المحسنة
+# ==============================
+def parse_content_info(message_text, channel_id, has_video):
+    """
+    تحليل نص الرسالة لاستخراج المعلومات.
+    تعتمد على وجود فيديو أو لا، وتستخدم السياق للقناة.
+    """
+    global series_context
+
     if not message_text:
         return None, None, None, None
 
     text = message_text.strip()
-    original = text
 
-    # كلمات مفتاحية للمسلسلات
+    # كلمات مفتاحية
     series_keywords = ['حلقة', 'الحلقة', 'موسم', 'الموسم', 'season', 'episode', ' s', ' e']
-    # كلمات مفتاحية للأفلام
     movie_keywords = ['فيلم', 'الجزء', 'part']
 
-    # تحديد نوع المحتوى
-    is_series = any(kw in text.lower() for kw in series_keywords)
-    is_movie = any(kw in text.lower() for kw in movie_keywords) and not is_series
+    # إذا كان هناك فيديو
+    if has_video:
+        # محاولة التعرف على المحتوى بالأنماط المعتادة أولاً
+        is_series = any(kw in text.lower() for kw in series_keywords)
+        is_movie = any(kw in text.lower() for kw in movie_keywords) and not is_series
 
-    # ========== مسلسلات ==========
-    if is_series:
-        # 1. نمط: (اسم) الموسم (رقم) الحلقة (رقم)
-        match = re.search(r'^(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$', text, re.UNICODE)
-        if match:
-            raw_name = match.group(1).strip()
-            season = int(match.group(2))
-            episode = int(match.group(3))
-            name = clean_name_for_series(raw_name)
-            return name, 'series', season, episode
+        # مسلسلات
+        if is_series:
+            # (نفس الأنماط السابقة)
+            # نمط: الموسم X الحلقة Y
+            match = re.search(r'الموسم\s*(\d+)\s*الحلقة\s*(\d+)', text)
+            if match:
+                season = int(match.group(1))
+                episode = int(match.group(2))
+                name = re.sub(r'الموسم\s*\d+\s*الحلقة\s*\d+', '', text).strip()
+                name = clean_name_for_series(name)
+                return name, 'series', season, episode
+            # نمط: S1E2
+            match = re.search(r'[Ss](\d+)[Ee](\d+)', text)
+            if match:
+                season = int(match.group(1))
+                episode = int(match.group(2))
+                name = re.sub(r'[Ss]\d+[Ee]\d+', '', text).strip()
+                name = clean_name_for_series(name)
+                return name, 'series', season, episode
+            # إذا وجدنا كلمة "حلقة" فقط (الموسم 1)
+            match = re.search(r'الحلقة\s*(\d+)', text)
+            if match:
+                episode = int(match.group(1))
+                name = re.sub(r'الحلقة\s*\d+', '', text).strip()
+                name = clean_name_for_series(name)
+                return name, 'series', 1, episode
+            # إذا وجدنا رقمين فقط (افترض أنهما الموسم والحلقة)
+            numbers = re.findall(r'\d+', text)
+            if len(numbers) >= 2:
+                name = re.sub(r'\d+', '', text).strip()
+                name = clean_name_for_series(name)
+                season = int(numbers[0])
+                episode = int(numbers[1])
+                return name, 'series', season, episode
+            # إذا وجدنا رقم واحد فقط مع وجود كلمات مسلسل، نفترض أنه رقم الحلقة والموسم 1
+            if len(numbers) == 1:
+                name = re.sub(r'\d+', '', text).strip()
+                name = clean_name_for_series(name)
+                return name, 'series', 1, int(numbers[0])
 
-        # 2. نمط: (اسم) S(رقم)E(رقم)
-        match = re.search(r'^(.*?)\s+[Ss](\d+)[Ee](\d+)$', text)
-        if match:
-            raw_name = match.group(1).strip()
-            season = int(match.group(2))
-            episode = int(match.group(3))
-            name = clean_name_for_series(raw_name)
-            return name, 'series', season, episode
+        # أفلام
+        elif is_movie:
+            match = re.search(r'الجزء\s*(\d+)', text)
+            if match:
+                part = int(match.group(1))
+                name = re.sub(r'الجزء\s*\d+', '', text).strip()
+                name = clean_name_for_movie(name)
+                return name, 'movie', part, 1
+            # إذا كان هناك كلمة "فيلم" بدون جزء
+            if 'فيلم' in text:
+                name = re.sub(r'فيلم', '', text).strip()
+                name = clean_name_for_movie(name)
+                return name, 'movie', 1, 1
+            # إذا كان هناك رقم في النهاية فقط (افترض أنه الجزء)
+            numbers = re.findall(r'\d+', text)
+            if numbers:
+                name = re.sub(r'\d+', '', text).strip()
+                name = clean_name_for_movie(name)
+                return name, 'movie', int(numbers[-1]), 1
+            # نص عادي بدون كلمات مفتاحية - فيلم جزء 1
+            name = clean_name_for_movie(text)
+            return name, 'movie', 1, 1
 
-        # 3. نمط: (اسم) الحلقة (رقم) من الموسم (رقم)
-        match = re.search(r'^(.*?)\s+الحلقة\s+(\d+)\s+من\s+الموسم\s+(\d+)$', text, re.UNICODE)
-        if match:
-            raw_name = match.group(1).strip()
-            episode = int(match.group(2))
-            season = int(match.group(3))
-            name = clean_name_for_series(raw_name)
-            return name, 'series', season, episode
+        # إذا لم نجد كلمات مفتاحية، ولكن هناك فيديو
+        else:
+            # قد يكون مجرد رقم (حلقة من مسلسل سابق)
+            numbers = re.findall(r'\d+', text)
+            # إذا كان النص عبارة عن رقم فقط (أو رقم مع كلمات قليلة) ونحن في سياق مسلسل
+            if numbers and len(numbers) <= 2 and series_context[channel_id] is not None:
+                # نفترض أنه حلقة من المسلسل الأخير
+                name = series_context[channel_id]
+                # إذا كان هناك رقمان، الأول موسم والثاني حلقة
+                if len(numbers) >= 2:
+                    season = int(numbers[0])
+                    episode = int(numbers[1])
+                else:
+                    season = 1
+                    episode = int(numbers[0])
+                logger.debug(f"استخدام السياق: {name} - م{season} ح{episode}")
+                return name, 'series', season, episode
+            # إذا لم يكن هناك سياق، نعتبره فيلم جزء 1
+            else:
+                name = clean_name_for_movie(text)
+                return name, 'movie', 1, 1
 
-        # 4. نمط: (اسم) الموسم (رقم) - (رقم)
-        match = re.search(r'^(.*?)\s+الموسم\s+(\d+)[-\s]+(\d+)$', text, re.UNICODE)
-        if match:
-            raw_name = match.group(1).strip()
-            season = int(match.group(2))
-            episode = int(match.group(3))
-            name = clean_name_for_series(raw_name)
-            return name, 'series', season, episode
-
-        # 5. نمط: (اسم) الحلقة (رقم) فقط (الموسم 1)
-        match = re.search(r'^(.*?)\s+الحلقة\s+(\d+)$', text, re.UNICODE)
-        if match:
-            raw_name = match.group(1).strip()
-            episode = int(match.group(2))
-            name = clean_name_for_series(raw_name)
-            return name, 'series', 1, episode
-
-        # 6. استخراج أي رقمين من النص
-        numbers = re.findall(r'\d+', text)
-        if len(numbers) >= 2:
-            name = re.sub(r'\d+', '', text).strip()
-            name = clean_name_for_series(name)
-            season = int(numbers[0])
-            episode = int(numbers[1])
-            return name, 'series', season, episode
-        elif len(numbers) == 1:
-            name = re.sub(r'\d+', '', text).strip()
-            name = clean_name_for_series(name)
-            return name, 'series', 1, int(numbers[0])
-
-        # 7. نص بدون أرقام – نفترض موسم 1 حلقة 1
-        name = clean_name_for_series(text)
-        return name, 'series', 1, 1
-
-    # ========== أفلام ==========
+    # إذا لم يكن هناك فيديو (بوست نصي فقط)
     else:
-        # 1. نمط: فيلم (الاسم) الجزء (رقم)
-        match = re.search(r'فيلم\s+(.+?)\s+الجزء\s+(\d+)', text, re.UNICODE)
-        if match:
-            name = match.group(1).strip()
-            part = int(match.group(2))
-            return clean_name_for_movie(name), 'movie', part, 1
+        # هذا قد يكون بوست تعريف لمسلسل جديد
+        # نتأكد أنه لا يحتوي على كلمات مفتاحية للحلقات (أي ليس حلقة)
+        if not any(kw in text.lower() for kw in series_keywords + movie_keywords):
+            # نخزن الاسم في سياق القناة
+            name = clean_name_for_series(text)
+            if name:  # إذا كان اسماً غير فارغ
+                series_context[channel_id] = name
+                logger.info(f"📝 تم تسجيل سياق مسلسل جديد: {name} في {channel_id}")
+        # لا نرجع بيانات لأن هذا البوست ليس له فيديو
+        return None, None, None, None
 
-        # 2. نمط: فيلم (الاسم) (رقم)
-        match = re.search(r'فيلم\s+(.+?)\s+(\d+)$', text, re.UNICODE)
-        if match:
-            name = match.group(1).strip()
-            part = int(match.group(2))
-            return clean_name_for_movie(name), 'movie', part, 1
-
-        # 3. نمط: (الاسم) الجزء (رقم) بدون فيلم
-        match = re.search(r'^(.*?)\s+الجزء\s+(\d+)$', text, re.UNICODE)
-        if match:
-            name = match.group(1).strip()
-            part = int(match.group(2))
-            return clean_name_for_movie(name), 'movie', part, 1
-
-        # 4. نمط: (الاسم) ينتهي برقم
-        match = re.search(r'^(.*?)\s+(\d+)$', text, re.UNICODE)
-        if match:
-            name = match.group(1).strip()
-            part = int(match.group(2))
-            return clean_name_for_movie(name), 'movie', part, 1
-
-        # 5. أي نص آخر – فيلم جزء 1
-        name = clean_name_for_movie(text)
-        return name, 'movie', 1, 1
-
+# ==============================
+# 7. دوال المساعدة الأخرى
+# ==============================
 async def get_channel_entity(client, channel_input):
     try:
         channel = await client.get_entity(channel_input)
@@ -305,7 +321,6 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
 def delete_from_database(message_id):
     try:
         with engine.begin() as conn:
-            # حذف الحلقة ومعرفة ما إذا كان المسلسل أصبح فارغاً
             ep = conn.execute(
                 text("SELECT series_id FROM episodes WHERE telegram_message_id = :msg"),
                 {"msg": message_id}
@@ -328,11 +343,15 @@ def delete_from_database(message_id):
         logger.error(f"❌ خطأ في الحذف: {e}")
         return False
 
+# ==============================
+# 8. دوال المزامنة والاستيراد
+# ==============================
 async def sync_channel_messages(client, channel):
     channel_id = f"@{channel.username}" if channel.username else str(channel.id)
     logger.info(f"\n🔄 مزامنة {channel.title} ({channel_id})")
     messages = []
     async for msg in client.iter_messages(channel, limit=1000):
+        # نأخذ جميع الرسائل حتى النصية لبناء السياق
         if msg.text:
             messages.append(msg)
     logger.debug(f"📊 {len(messages)} رسالة نصية")
@@ -347,17 +366,21 @@ async def sync_channel_messages(client, channel):
     new = 0
     skipped = 0
     failed = 0
-    for msg in messages:
+
+    # نمر على الرسائل بترتيب زمني تصاعدي (الأقدم أولاً) لبناء السياق بشكل صحيح
+    for msg in reversed(messages):
         if msg.id in stored_set:
             skipped += 1
             continue
-        name, ctype, season, episode = parse_content_info(msg.text)
-        if name and ctype and episode:
+
+        has_video = msg.video or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+        name, ctype, season, episode = parse_content_info(msg.text, channel_id, has_video)
+
+        if name and ctype and episode and has_video:  # نحتاج فيديو للحفظ
             if save_to_database(name, ctype, season, episode, msg.id, channel_id):
                 new += 1
                 stored_set.add(msg.id)
             else:
-                # تحقق إذا كان موجوداً بالفعل
                 with engine.connect() as conn2:
                     exists = conn2.execute(
                         text("SELECT 1 FROM episodes WHERE telegram_message_id = :mid"),
@@ -369,8 +392,12 @@ async def sync_channel_messages(client, channel):
                         failed += 1
                         logger.error(f"❌ فشل إدراج {msg.id}")
         else:
-            failed += 1
-    logger.info(f"✅ {channel.title}: {new} جديدة, {skipped} موجودة, {failed} فشل تحليل")
+            # إذا كانت رسالة بدون فيديو، قد تكون سياقاً فقط (تم التعامل معه داخل parse)
+            if not has_video:
+                logger.debug(f"📝 رسالة تعريف (بدون فيديو): {msg.id}")
+            else:
+                failed += 1
+    logger.info(f"✅ {channel.title}: {new} جديدة, {skipped} موجودة, {failed} فشل")
 
 async def import_channel_history(client, channel):
     channel_id = f"@{channel.username}" if channel.username else str(channel.id)
@@ -379,7 +406,7 @@ async def import_channel_history(client, channel):
     async for msg in client.iter_messages(channel, limit=None):
         if msg.text:
             all_msgs.append(msg)
-    all_msgs.reverse()
+    all_msgs.reverse()  # أقدم أولاً
     logger.debug(f"📊 {len(all_msgs)} رسالة")
 
     with engine.connect() as conn:
@@ -392,12 +419,16 @@ async def import_channel_history(client, channel):
     new = 0
     skipped = 0
     failed = 0
+
     for msg in all_msgs:
         if msg.id in stored_set:
             skipped += 1
             continue
-        name, ctype, season, episode = parse_content_info(msg.text)
-        if name and ctype and episode:
+
+        has_video = msg.video or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+        name, ctype, season, episode = parse_content_info(msg.text, channel_id, has_video)
+
+        if name and ctype and episode and has_video:
             if save_to_database(name, ctype, season, episode, msg.id, channel_id):
                 new += 1
                 stored_set.add(msg.id)
@@ -413,7 +444,10 @@ async def import_channel_history(client, channel):
                         failed += 1
                         logger.error(f"❌ فشل إدراج {msg.id}")
         else:
-            failed += 1
+            if not has_video:
+                logger.debug(f"📝 رسالة تعريف: {msg.id}")
+            else:
+                failed += 1
     logger.info(f"📥 {channel.title}: {new} جديدة, {skipped} موجودة, {failed} فشل")
 
 async def check_deleted_messages(client, channel):
@@ -442,7 +476,7 @@ async def check_deleted_messages(client, channel):
         logger.error(f"❌ خطأ: {e}")
 
 # ==============================
-# 6. الدالة الرئيسية
+# 9. الدالة الرئيسية
 # ==============================
 async def monitor_channels():
     logger.info(f"مراقبة {len(CHANNEL_LIST)} قناة")
@@ -459,6 +493,10 @@ async def monitor_channels():
     if not channels:
         logger.error("لا توجد قنوات صالحة")
         return
+
+    # إعادة تعيين السياق لكل قناة
+    global series_context
+    series_context.clear()
 
     # مزامنة أولية
     for ch in channels:
@@ -479,9 +517,10 @@ async def monitor_channels():
     async def handler(event):
         msg = event.message
         if msg.text:
-            name, ctype, season, episode = parse_content_info(msg.text)
-            if name and ctype and episode:
-                chan_id = f"@{msg.chat.username}" if msg.chat.username else str(msg.chat.id)
+            chan_id = f"@{msg.chat.username}" if msg.chat.username else str(msg.chat.id)
+            has_video = msg.video or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+            name, ctype, season, episode = parse_content_info(msg.text, chan_id, has_video)
+            if name and ctype and episode and has_video:
                 save_to_database(name, ctype, season, episode, msg.id, chan_id)
 
     @client.on(events.MessageDeleted(chats=channels))
