@@ -23,6 +23,7 @@ STRING_SESSION = os.environ.get("STRING_SESSION", "")
 IMPORT_HISTORY = os.environ.get("IMPORT_HISTORY", "false").lower() == "true"
 CHECK_DELETED_MESSAGES = os.environ.get("CHECK_DELETED_MESSAGES", "true").lower() == "true"
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
+RESET_DATABASE = os.environ.get("RESET_DATABASE", "false").lower() == "true"  # خيار جديد لإعادة التعيين
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -40,13 +41,20 @@ if DATABASE_URL.startswith("postgres://"):
 CHANNEL_LIST = [chan.strip() for chan in CHANNELS.split(',') if chan.strip()]
 
 # ------------------------------
-# اتصال قاعدة البيانات
+# اتصال قاعدة البيانات وإعادة التعيين إذا لزم الأمر
 # ------------------------------
 try:
     engine = create_engine(DATABASE_URL)
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
     logger.info("✅ اتصال بقاعدة البيانات")
+    
+    if RESET_DATABASE:
+        logger.warning("⚠️ جاري إعادة تعيين قاعدة البيانات...")
+        with engine.begin() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+        logger.info("✅ تم إعادة تعيين قاعدة البيانات")
 except Exception as e:
     logger.error(f"❌ فشل الاتصال: {e}")
     sys.exit(1)
@@ -80,15 +88,6 @@ with engine.begin() as conn:
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_channel_id ON episodes(telegram_channel_id)"))
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_added_at ON episodes(added_at)"))
 logger.info("✅ الجداول جاهزة")
-
-# تحديث الأسماء المقيسة للبيانات القديمة (إن وجدت)
-with engine.begin() as conn:
-    rows = conn.execute(text("SELECT id, name FROM series WHERE normalized_name IS NULL")).fetchall()
-    for row in rows:
-        norm = normalize_series_name(row[1])
-        conn.execute(text("UPDATE series SET normalized_name = :norm WHERE id = :id"), {"norm": norm, "id": row[0]})
-    if rows:
-        logger.info(f"✅ تم تحديث {len(rows)} اسماً مقيساً")
 
 # ------------------------------
 # دوال التنظيف والتطبيع
@@ -132,7 +131,7 @@ def clean_name_for_movie(name):
 series_context = defaultdict(lambda: None)
 
 # ------------------------------
-# دالة التحليل المتقدمة (معدلة لتجنب تعارض الاسم مع دالة SQLAlchemy text)
+# دالة التحليل المحسنة (بدون تعارض مع SQLAlchemy text)
 # ------------------------------
 def parse_content_info(msg_text, channel_id, has_video):
     """
@@ -231,7 +230,7 @@ def parse_content_info(msg_text, channel_id, has_video):
             name = clean_name_for_series(msg_text)
             return name, 'series', 1, 1
 
-        # 9. نص عادي ينتهي برقم (قد يكون جزء من مسلسل)
+        # 9. نص عادي ينتهي برقم (قد يكون جزء من مسلسل) - البحث في قاعدة البيانات عن مسلسل مشابه
         # نتحقق مما إذا كان هناك مسلسل بنفس الاسم الأساسي في قاعدة البيانات
         base_name = re.sub(r'\s+\d+$', '', msg_text).strip()
         if base_name and base_name != msg_text:
@@ -356,7 +355,7 @@ def delete_from_database(msg_id):
         return False
 
 def clean_orphan_series():
-    """حذف المسلسلات/الأفلام التي ليس لها أي حلقات (تم إنشاؤها من بوست تعريف ولم تأتِ حلقات)"""
+    """حذف المسلسلات/الأفلام التي ليس لها أي حلقات"""
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
@@ -372,13 +371,9 @@ def clean_orphan_series():
         logger.error(f"❌ خطأ في تنظيف السلسلة اليتيمة: {e}")
 
 def fix_misclassified_series():
-    """
-    تصحيح المسلسلات التي تم تصنيفها خطأ كأفلام (movie) ولكن لديها أكثر من حلقة.
-    نبحث عن أي series type='movie' لديه عدة حلقات، ونحول type إلى 'series'.
-    """
+    """تصحيح المسلسلات المصنفة خطأ كأفلام (إذا كان لديها أكثر من حلقة)"""
     try:
         with engine.begin() as conn:
-            # نجد الأفلام التي لديها أكثر من حلقة
             rows = conn.execute(text("""
                 SELECT s.id, s.name, COUNT(e.id) as ep_count
                 FROM series s
@@ -403,6 +398,7 @@ def fix_misclassified_series():
 # مزامنة القنوات
 # ------------------------------
 async def sync_channel_messages(client, channel):
+    """مزامنة آخر 1000 رسالة (تستخدم للمزامنة الأولية السريعة)"""
     chan_id = f"@{channel.username}" if channel.username else str(channel.id)
     logger.info(f"\n🔄 مزامنة {channel.title} ({chan_id})")
 
@@ -412,6 +408,8 @@ async def sync_channel_messages(client, channel):
         if msg.text:
             messages.append(msg)
     messages.reverse()  # أقدم أولاً لبناء السياق
+
+    logger.info(f"📊 تم جلب {len(messages)} رسالة نصية (آخر 1000)")
 
     # معرفات المخزنة
     with engine.connect() as conn:
@@ -423,7 +421,8 @@ async def sync_channel_messages(client, channel):
 
     new = 0
     skipped = 0
-    failed = 0
+    failed_parse = 0
+    no_video = 0
 
     for msg in messages:
         if msg.id in stored_set:
@@ -431,14 +430,20 @@ async def sync_channel_messages(client, channel):
             continue
 
         has_video = msg.video or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+        if not has_video:
+            no_video += 1
+            # مع ذلك، نمررها لـ parse_content_info لتحديث السياق
+            parse_content_info(msg.text, chan_id, has_video)
+            continue
+
         name, typ, season, ep = parse_content_info(msg.text, chan_id, has_video)
 
-        if name and typ and ep and has_video:
+        if name and typ and ep:
             if save_to_database(name, typ, season, ep, msg.id, chan_id):
                 new += 1
                 stored_set.add(msg.id)
             else:
-                # فشل - تحقق من وجودها
+                # فشل الإدراج - قد يكون موجوداً مسبقاً
                 with engine.connect() as conn2:
                     exists = conn2.execute(
                         text("SELECT 1 FROM episodes WHERE telegram_message_id = :mid"),
@@ -447,25 +452,25 @@ async def sync_channel_messages(client, channel):
                     if exists:
                         skipped += 1
                     else:
-                        failed += 1
-                        logger.error(f"❌ فشل إدراج {msg.id}")
+                        failed_parse += 1
+                        logger.error(f"❌ فشل إدراج {msg.id} (غير معروف السبب)")
         else:
-            if not has_video:
-                logger.debug(f"📝 رسالة تعريف (بدون فيديو): {msg.id}")
-            else:
-                failed += 1
+            failed_parse += 1
+            logger.debug(f"⚠️ فشل تحليل الرسالة {msg.id}: {msg.text[:50]}...")
 
-    logger.info(f"✅ {channel.title}: {new} جديدة, {skipped} موجودة, {failed} فشل")
+    logger.info(f"✅ {channel.title}: {new} جديدة, {skipped} موجودة, {failed_parse} فشل تحليل, {no_video} بدون فيديو")
 
 async def import_channel_history(client, channel):
+    """استيراد جميع الرسائل القديمة (بدون حد)"""
     chan_id = f"@{channel.username}" if channel.username else str(channel.id)
     logger.info(f"\n📂 استيراد كامل {channel.title}")
+
     all_msgs = []
     async for msg in client.iter_messages(channel, limit=None):
         if msg.text:
             all_msgs.append(msg)
-    all_msgs.reverse()
-    logger.debug(f"📊 {len(all_msgs)} رسالة")
+    all_msgs.reverse()  # أقدم أولاً
+    logger.info(f"📊 تم جلب {len(all_msgs)} رسالة نصية (كامل التاريخ)")
 
     with engine.connect() as conn:
         stored = conn.execute(
@@ -476,7 +481,8 @@ async def import_channel_history(client, channel):
 
     new = 0
     skipped = 0
-    failed = 0
+    failed_parse = 0
+    no_video = 0
 
     for msg in all_msgs:
         if msg.id in stored_set:
@@ -484,9 +490,15 @@ async def import_channel_history(client, channel):
             continue
 
         has_video = msg.video or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+        if not has_video:
+            no_video += 1
+            # تحديث السياق
+            parse_content_info(msg.text, chan_id, has_video)
+            continue
+
         name, typ, season, ep = parse_content_info(msg.text, chan_id, has_video)
 
-        if name and typ and ep and has_video:
+        if name and typ and ep:
             if save_to_database(name, typ, season, ep, msg.id, chan_id):
                 new += 1
                 stored_set.add(msg.id)
@@ -499,15 +511,13 @@ async def import_channel_history(client, channel):
                     if exists:
                         skipped += 1
                     else:
-                        failed += 1
-                        logger.error(f"❌ فشل إدراج {msg.id}")
+                        failed_parse += 1
+                        logger.error(f"❌ فشل إدراج {msg.id} (غير معروف السبب)")
         else:
-            if not has_video:
-                logger.debug(f"📝 رسالة تعريف: {msg.id}")
-            else:
-                failed += 1
+            failed_parse += 1
+            logger.debug(f"⚠️ فشل تحليل الرسالة {msg.id}: {msg.text[:50]}...")
 
-    logger.info(f"📥 {channel.title}: {new} جديدة, {skipped} موجودة, {failed} فشل")
+    logger.info(f"📥 {channel.title}: {new} جديدة, {skipped} موجودة, {failed_parse} فشل تحليل, {no_video} بدون فيديو")
 
 async def check_deleted_messages(client, channel):
     chan_id = f"@{channel.username}" if channel.username else str(channel.id)
@@ -569,7 +579,7 @@ async def monitor_channels():
     # تنظيف المسلسلات بدون حلقات
     clean_orphan_series()
 
-    # تصحيح التصنيف الخاطئ (مسلسلات في الأفلام)
+    # تصحيح التصنيف الخاطئ
     fix_misclassified_series()
 
     # فحص المحذوفات
