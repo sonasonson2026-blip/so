@@ -608,17 +608,16 @@ async def debug_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ep_numbers = [ep[0] for ep in episodes]
             min_ep = min(ep_numbers)
             max_ep = max(ep_numbers)
-            text = f"🔍 <b>المسلسل ID {series_id} - الموسم {season}</b>\n"
-            text += f"إجمالي الحلقات: {count}\n"
-            text += f"أصغر رقم حلقة: {min_ep}\n"
-            text += f"أكبر رقم حلقة: {max_ep}\n"
-            text += f"أول 20 رقم: {', '.join(map(str, ep_numbers[:20]))}"
+            msg = f"🔍 <b>المسلسل ID {series_id} - الموسم {season}</b>\n"
+            msg += f"إجمالي الحلقات: {count}\n"
+            msg += f"أصغر رقم حلقة: {min_ep}\n"
+            msg += f"أكبر رقم حلقة: {max_ep}\n"
+            msg += f"أول 20 رقم: {', '.join(map(str, ep_numbers[:20]))}"
             if len(ep_numbers) > 20:
-                text += f"... (و{len(ep_numbers)-20} أخرى)"
-            await update.message.reply_text(text, parse_mode='HTML')
+                msg += f"... (و{len(ep_numbers)-20} أخرى)"
+            await update.message.reply_text(msg, parse_mode='HTML')
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
-
 # ==============================
 # 8. اختبار قاعدة البيانات من الزر
 # ==============================
