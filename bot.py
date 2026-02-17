@@ -750,16 +750,16 @@ async def debug_all_episodes(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 if season not in result:
                     result[season] = []
                 result[season].append(ep)
-            text = f"📊 جميع حلقات المسلسل {series_id}:\n\n"
+            msg = f"📊 جميع حلقات المسلسل {series_id}:\n\n"
             for season in sorted(result.keys()):
                 eps = result[season]
-                text += f"الموسم {season}: {len(eps)} حلقة (من {min(eps)} إلى {max(eps)})\n"
+                msg += f"الموسم {season}: {len(eps)} حلقة (من {min(eps)} إلى {max(eps)})\n"
                 # عرض أول 20 رقم للموسم
-                text += f"  الأرقام: {', '.join(map(str, eps[:20]))}"
+                msg += f"  الأرقام: {', '.join(map(str, eps[:20]))}"
                 if len(eps) > 20:
-                    text += f"... (و{len(eps)-20} أخرى)"
-                text += "\n\n"
-            await update.message.reply_text(text, parse_mode='HTML')
+                    msg += f"... (و{len(eps)-20} أخرى)"
+                msg += "\n\n"
+            await update.message.reply_text(msg, parse_mode='HTML')
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
 # ==============================
