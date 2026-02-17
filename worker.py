@@ -132,7 +132,7 @@ def clean_name_for_movie(name):
 series_context = defaultdict(lambda: None)
 
 # ------------------------------
-# دالة التحليل المتقدمة (معدلة للتمييز بين مسلسل وفيلم)
+# دالة التحليل المتقدمة (معدلة)
 # ------------------------------
 def parse_content_info(text, channel_id, has_video):
     """
@@ -150,14 +150,13 @@ def parse_content_info(text, channel_id, has_video):
     series_keywords = ['حلقة', 'الحلقة', 'موسم', 'الموسم', 'season', 'episode']
     movie_keywords = ['فيلم', 'الجزء', 'part']
 
-    # تحديد نوع المحتوى بناءً على وجود كلمات محددة
+    # تحديد وجود كلمات مسلسل/فيلم
     is_series_word = 'مسلسل' in lower_text
     is_movie_word = 'فيلم' in lower_text
 
     # إذا كان هناك فيديو
     if has_video:
-        # محاولة التعرف على المسلسل
-        # الأنماط الشائعة للمسلسلات
+        # محاولة التعرف على المسلسل بأنماطه
         # 1. اسم + الموسم X + الحلقة Y
         match = re.search(r'^(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$', text, re.UNICODE)
         if match:
@@ -197,9 +196,9 @@ def parse_content_info(text, channel_id, has_video):
             episode = int(match.group(2))
             return name, 'series', 1, episode
 
-        # 6. إذا كان النص يحتوي على كلمة "فيلم"
+        # 6. إذا كان النص يحتوي على كلمة "فيلم" صراحة
         if is_movie_word or any(kw in lower_text for kw in movie_keywords):
-            # فيلم
+            # فيلم بأنماطه
             match = re.search(r'فيلم\s+(.+?)\s+الجزء\s+(\d+)', text, re.UNICODE)
             if match:
                 name = clean_name_for_movie(match.group(1))
@@ -216,9 +215,8 @@ def parse_content_info(text, channel_id, has_video):
 
         # 7. إذا كان النص يتكون أساسًا من أرقام (قد يكون حلقة من مسلسل سابق)
         numbers = re.findall(r'\d+', text)
-        # إذا كان هناك سياق مسلسل لهذه القناة
         if numbers and series_context[channel_id] is not None:
-            # إذا كان هناك رقمان (موسم وحلقة) أو رقم واحد (حلقة)
+            # يوجد سياق مسلسل لهذه القناة
             if len(numbers) >= 2:
                 season = int(numbers[0])
                 episode = int(numbers[1])
@@ -228,12 +226,31 @@ def parse_content_info(text, channel_id, has_video):
             logger.debug(f"استخدام السياق: {series_context[channel_id]} - م{season} ح{episode}")
             return series_context[channel_id], 'series', season, episode
 
-        # 8. إذا كان النص يحتوي على كلمة "مسلسل" (حتى بدون كلمات حلقة/موسم) -> نعتبره مسلسل ولكن قد نحتاج لسياق؟ نفترض أنه بوست تعريف مع فيديو خطأ؟ نادر.
+        # 8. إذا كان النص يحتوي على كلمة "مسلسل" (حتى بدون كلمات حلقة/موسم)
         if is_series_word:
             name = clean_name_for_series(text)
-            return name, 'series', 1, 1   # افتراضي
+            return name, 'series', 1, 1
 
-        # 9. نص عادي بدون كلمات مفتاحية – فيلم افتراضي
+        # 9. نص عادي ينتهي برقم (قد يكون جزء من مسلسل)
+        # نتحقق مما إذا كان هناك مسلسل بنفس الاسم الأساسي في قاعدة البيانات
+        base_name = re.sub(r'\s+\d+$', '', text).strip()
+        if base_name and base_name != text:
+            # استعلام عن وجود مسلسل بهذا الاسم الأساسي
+            with engine.connect() as conn:
+                exists = conn.execute(
+                    text("SELECT 1 FROM series WHERE name ILIKE :pat AND type='series' LIMIT 1"),
+                    {"pat": f"%{base_name}%"}
+                ).scalar()
+            if exists:
+                # يوجد مسلسل مشابه، نصنفها كحلقة
+                name = clean_name_for_series(base_name)
+                # استخراج الرقم من النهاية
+                num_match = re.search(r'(\d+)$', text)
+                if num_match:
+                    episode = int(num_match.group(1))
+                    return name, 'series', 1, episode
+
+        # 10. افتراضياً، نعتبره فيلم
         name = clean_name_for_movie(text)
         return name, 'movie', 1, 1
 
@@ -242,7 +259,6 @@ def parse_content_info(text, channel_id, has_video):
         # إذا كان النص لا يحتوي على كلمات مفتاحية للحلقات، قد يكون اسم مسلسل جديد
         if not any(kw in lower_text for kw in series_keywords + movie_keywords):
             # نعتبره اسماً لمسلسل (أو فيلم) سيظهر لاحقاً
-            # لكن نفضل تخزينه كمسلسل إذا كان يحوي كلمة مسلسل أو لا يحوي كلمة فيلم
             if is_series_word or (not is_movie_word and not re.search(r'\d', text)):
                 name = clean_name_for_series(text)
                 if name:
@@ -354,6 +370,34 @@ def clean_orphan_series():
                 logger.info(f"✅ تم تنظيف {len(result)} مسلسل/فيلم بدون حلقات")
     except Exception as e:
         logger.error(f"❌ خطأ في تنظيف السلسلة اليتيمة: {e}")
+
+def fix_misclassified_series():
+    """
+    تصحيح المسلسلات التي تم تصنيفها خطأ كأفلام (movie) ولكن لديها أكثر من حلقة.
+    نبحث عن أي series type='movie' لديه عدة حلقات، ونحول type إلى 'series'.
+    """
+    try:
+        with engine.begin() as conn:
+            # نجد الأفلام التي لديها أكثر من حلقة
+            rows = conn.execute(text("""
+                SELECT s.id, s.name, COUNT(e.id) as ep_count
+                FROM series s
+                JOIN episodes e ON s.id = e.series_id
+                WHERE s.type = 'movie'
+                GROUP BY s.id, s.name
+                HAVING COUNT(e.id) > 1
+            """)).fetchall()
+            if rows:
+                for row in rows:
+                    sid, name, count = row
+                    conn.execute(
+                        text("UPDATE series SET type = 'series' WHERE id = :sid"),
+                        {"sid": sid}
+                    )
+                    logger.info(f"🔄 تم تصحيح {name} (ID: {sid}) من فيلم إلى مسلسل (لديه {count} حلقات)")
+                logger.info(f"✅ تم تصحيح {len(rows)} مسلسل كان مصنف خطأ كفيلم")
+    except Exception as e:
+        logger.error(f"❌ خطأ في تصحيح التصنيف: {e}")
 
 # ------------------------------
 # مزامنة القنوات
@@ -522,8 +566,11 @@ async def monitor_channels():
         for ch in channels:
             await import_channel_history(client, ch)
 
-    # تنظيف المسلسلات بدون حلقات (اليتيمة)
+    # تنظيف المسلسلات بدون حلقات
     clean_orphan_series()
+
+    # تصحيح التصنيف الخاطئ (مسلسلات في الأفلام)
+    fix_misclassified_series()
 
     # فحص المحذوفات
     if CHECK_DELETED_MESSAGES:
@@ -540,6 +587,8 @@ async def monitor_channels():
             name, typ, season, ep = parse_content_info(msg.text, chan_id, has_video)
             if name and typ and ep and has_video:
                 save_to_database(name, typ, season, ep, msg.id, chan_id)
+                # بعد الإضافة، نتحقق مرة أخرى من التصنيف الخاطئ (اختياري)
+                # قد نستدعي fix_misclassified_series() بشكل دوري، لكن ليس كل مرة
 
     @client.on(events.MessageDeleted(chats=channels))
     async def delete_handler(event):
