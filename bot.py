@@ -9,7 +9,7 @@ from telegram.ext import (
 from sqlalchemy import create_engine, text
 
 # ==============================
-# 1. الإعدادات والتكوين
+# 1. الإعدادات 
 # ==============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
