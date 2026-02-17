@@ -88,7 +88,7 @@ async def get_content_info(series_id):
         logger.error(f"خطأ في جلب معلومات المحتوى {series_id}: {e}")
         return None
 
-async def get_season_episodes(series_id, season, page=1, per_page=50):
+async def get_season_episodes(series_id, season, page=1, per_page=60):
     """جلب حلقات موسم محدد مع دعم الصفحات."""
     if not engine:
         return [], 0, 0, page
