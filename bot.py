@@ -565,7 +565,7 @@ async def debug_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def find_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """البحث عن مسلسلات أو أفلام بالاسم."""
     if not context.args:
-        await update.message.reply_text("استخدم: /find <كلمة البحث>")
+        await update.message.reply_text("استخدم: /find <كلمة>")
         return
     search_term = ' '.join(context.args)
     try:
@@ -577,10 +577,10 @@ async def find_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not results:
                 await update.message.reply_text(f"لا توجد نتائج لـ '{search_term}'")
                 return
-            text = f"نتائج البحث عن '{search_term}':\n\n"
+            response = f"نتائج البحث عن '{search_term}':\n\n"
             for r in results:
-                text += f"• {r[1]} (ID: {r[0]}, نوع: {r[2]}, مقيس: {r[3]})\n"
-            await update.message.reply_text(text)
+                response += f"• {r[1]} (ID: {r[0]}, نوع: {r[2]}, مقيس: {r[3]})\n"
+            await update.message.reply_text(response)
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
 
