@@ -87,7 +87,7 @@ def clean_name_for_movie(name):
     return name
 
 # ==============================
-# 4. إنشاء الجداول وتحديثها
+# 4. إنشاء الجداول
 # ==============================
 with engine.begin() as conn:
     conn.execute(text("""
@@ -116,7 +116,7 @@ with engine.begin() as conn:
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_added_at ON episodes(added_at)"))
 logger.info("✅ تم إنشاء الجداول.")
 
-# تحديث الأسماء المقيسة للصفوف القديمة (إن وجدت)
+# تحديث الأسماء المقيسة (إذا وجدت بيانات سابقة)
 with engine.begin() as conn:
     rows = conn.execute(text("SELECT id, name FROM series WHERE normalized_name IS NULL")).fetchall()
     for row in rows:
@@ -126,57 +126,147 @@ with engine.begin() as conn:
         logger.info(f"✅ تم تحديث {len(rows)} اسماً مقيساً.")
 
 # ==============================
-# 5. دوال التحليل والحفظ
+# 5. دوال التحليل (الكاملة)
 # ==============================
 def parse_content_info(message_text):
-    """تحليل نص الرسالة (نفس الكود السابق)"""
+    """تحليل نص الرسالة لاستخراج المعلومات (محسّن جداً)."""
     if not message_text:
         return None, None, None, None
+
     text = message_text.strip()
-    # ... (نفس الأنماط السابقة) ...
-    # للاختصار، سأضع نسخة مختصرة، لكن يُفضل استخدام النسخة الكاملة من الردود السابقة
-    # هنا أستخدم نسخة مبسطة لتوضيح الفكرة فقط
-    series_keywords = ['حلقة', 'الحلقة', 'موسم', 'الموسم']
-    movie_keywords = ['فيلم', 'الجزء']
-    is_series = any(kw in text for kw in series_keywords)
+    original = text
+
+    # كلمات مفتاحية للمسلسلات
+    series_keywords = ['حلقة', 'الحلقة', 'موسم', 'الموسم', 'season', 'episode', ' s', ' e']
+    # كلمات مفتاحية للأفلام
+    movie_keywords = ['فيلم', 'الجزء', 'part']
+
+    # تحديد نوع المحتوى
+    is_series = any(kw in text.lower() for kw in series_keywords)
+    is_movie = any(kw in text.lower() for kw in movie_keywords) and not is_series
+
+    # ========== مسلسلات ==========
     if is_series:
-        # محاولة استخراج الموسم والحلقة
-        match = re.search(r'الموسم\s*(\d+)\s*الحلقة\s*(\d+)', text)
+        # 1. نمط: (اسم) الموسم (رقم) الحلقة (رقم)
+        match = re.search(r'^(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$', text, re.UNICODE)
         if match:
-            season = int(match.group(1))
-            episode = int(match.group(2))
-            name = re.sub(r'الموسم\s*\d+\s*الحلقة\s*\d+', '', text).strip()
-            name = clean_name_for_series(name)
+            raw_name = match.group(1).strip()
+            season = int(match.group(2))
+            episode = int(match.group(3))
+            name = clean_name_for_series(raw_name)
             return name, 'series', season, episode
-    else:
-        # فيلم
-        match = re.search(r'الجزء\s*(\d+)', text)
+
+        # 2. نمط: (اسم) S(رقم)E(رقم)
+        match = re.search(r'^(.*?)\s+[Ss](\d+)[Ee](\d+)$', text)
         if match:
-            part = int(match.group(1))
-            name = re.sub(r'الجزء\s*\d+', '', text).strip()
-            name = clean_name_for_movie(name)
-            return name, 'movie', part, 1
-    return None, None, None, None
+            raw_name = match.group(1).strip()
+            season = int(match.group(2))
+            episode = int(match.group(3))
+            name = clean_name_for_series(raw_name)
+            return name, 'series', season, episode
+
+        # 3. نمط: (اسم) الحلقة (رقم) من الموسم (رقم)
+        match = re.search(r'^(.*?)\s+الحلقة\s+(\d+)\s+من\s+الموسم\s+(\d+)$', text, re.UNICODE)
+        if match:
+            raw_name = match.group(1).strip()
+            episode = int(match.group(2))
+            season = int(match.group(3))
+            name = clean_name_for_series(raw_name)
+            return name, 'series', season, episode
+
+        # 4. نمط: (اسم) الموسم (رقم) - (رقم)
+        match = re.search(r'^(.*?)\s+الموسم\s+(\d+)[-\s]+(\d+)$', text, re.UNICODE)
+        if match:
+            raw_name = match.group(1).strip()
+            season = int(match.group(2))
+            episode = int(match.group(3))
+            name = clean_name_for_series(raw_name)
+            return name, 'series', season, episode
+
+        # 5. نمط: (اسم) الحلقة (رقم) فقط (الموسم 1)
+        match = re.search(r'^(.*?)\s+الحلقة\s+(\d+)$', text, re.UNICODE)
+        if match:
+            raw_name = match.group(1).strip()
+            episode = int(match.group(2))
+            name = clean_name_for_series(raw_name)
+            return name, 'series', 1, episode
+
+        # 6. استخراج أي رقمين من النص
+        numbers = re.findall(r'\d+', text)
+        if len(numbers) >= 2:
+            name = re.sub(r'\d+', '', text).strip()
+            name = clean_name_for_series(name)
+            season = int(numbers[0])
+            episode = int(numbers[1])
+            return name, 'series', season, episode
+        elif len(numbers) == 1:
+            name = re.sub(r'\d+', '', text).strip()
+            name = clean_name_for_series(name)
+            return name, 'series', 1, int(numbers[0])
+
+        # 7. نص بدون أرقام – نفترض موسم 1 حلقة 1
+        name = clean_name_for_series(text)
+        return name, 'series', 1, 1
+
+    # ========== أفلام ==========
+    else:
+        # 1. نمط: فيلم (الاسم) الجزء (رقم)
+        match = re.search(r'فيلم\s+(.+?)\s+الجزء\s+(\d+)', text, re.UNICODE)
+        if match:
+            name = match.group(1).strip()
+            part = int(match.group(2))
+            return clean_name_for_movie(name), 'movie', part, 1
+
+        # 2. نمط: فيلم (الاسم) (رقم)
+        match = re.search(r'فيلم\s+(.+?)\s+(\d+)$', text, re.UNICODE)
+        if match:
+            name = match.group(1).strip()
+            part = int(match.group(2))
+            return clean_name_for_movie(name), 'movie', part, 1
+
+        # 3. نمط: (الاسم) الجزء (رقم) بدون فيلم
+        match = re.search(r'^(.*?)\s+الجزء\s+(\d+)$', text, re.UNICODE)
+        if match:
+            name = match.group(1).strip()
+            part = int(match.group(2))
+            return clean_name_for_movie(name), 'movie', part, 1
+
+        # 4. نمط: (الاسم) ينتهي برقم
+        match = re.search(r'^(.*?)\s+(\d+)$', text, re.UNICODE)
+        if match:
+            name = match.group(1).strip()
+            part = int(match.group(2))
+            return clean_name_for_movie(name), 'movie', part, 1
+
+        # 5. أي نص آخر – فيلم جزء 1
+        name = clean_name_for_movie(text)
+        return name, 'movie', 1, 1
 
 async def get_channel_entity(client, channel_input):
-    # ... (نفس الكود السابق) ...
     try:
-        return await client.get_entity(channel_input)
-    except:
+        channel = await client.get_entity(channel_input)
+        return channel
+    except Exception as e:
+        logger.warning(f"⚠️ لا يمكن الوصول للقناة {channel_input}: {e}")
+        if isinstance(channel_input, str) and channel_input.startswith('https://t.me/+'):
+            try:
+                invite_hash = channel_input.split('+')[-1]
+                await client(ImportChatInviteRequest(invite_hash))
+                return await client.get_entity(channel_input)
+            except:
+                return None
         return None
 
 def save_to_database(name, content_type, season_num, episode_num, telegram_msg_id, channel_id):
-    """حفظ مع التأكد من الإدراج"""
     try:
         with engine.begin() as conn:
-            # البحث عن المسلسل
             normalized = normalize_series_name(name)
+            # البحث عن المسلسل
             result = conn.execute(
                 text("SELECT id FROM series WHERE normalized_name = :norm AND type = :type"),
                 {"norm": normalized, "type": content_type}
             ).fetchone()
             if not result:
-                # بحث بـ ILIKE
                 words = name.split()[:3]
                 if words:
                     like = '%' + '%'.join(words) + '%'
@@ -185,7 +275,6 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                         {"pat": like, "type": content_type}
                     ).fetchone()
             if not result:
-                # إنشاء جديد
                 result = conn.execute(
                     text("INSERT INTO series (name, normalized_name, type) VALUES (:name, :norm, :type) RETURNING id"),
                     {"name": name, "norm": normalized, "type": content_type}
@@ -214,24 +303,40 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
         return False
 
 def delete_from_database(message_id):
-    # ... (نفس الكود السابق) ...
-    pass
+    try:
+        with engine.begin() as conn:
+            # حذف الحلقة ومعرفة ما إذا كان المسلسل أصبح فارغاً
+            ep = conn.execute(
+                text("SELECT series_id FROM episodes WHERE telegram_message_id = :msg"),
+                {"msg": message_id}
+            ).fetchone()
+            if not ep:
+                return False
+            series_id = ep[0]
+            conn.execute(text("DELETE FROM episodes WHERE telegram_message_id = :msg"), {"msg": message_id})
+            remaining = conn.execute(
+                text("SELECT COUNT(*) FROM episodes WHERE series_id = :sid"),
+                {"sid": series_id}
+            ).scalar()
+            if remaining == 0:
+                conn.execute(text("DELETE FROM series WHERE id = :sid"), {"sid": series_id})
+                logger.info(f"🗑️ تم حذف المسلسل بالكامل (آخر حلقة {message_id})")
+            else:
+                logger.info(f"🗑️ تم حذف حلقة {message_id}")
+            return True
+    except Exception as e:
+        logger.error(f"❌ خطأ في الحذف: {e}")
+        return False
 
-# ==============================
-# 6. مزامنة القنوات
-# ==============================
 async def sync_channel_messages(client, channel):
     channel_id = f"@{channel.username}" if channel.username else str(channel.id)
     logger.info(f"\n🔄 مزامنة {channel.title} ({channel_id})")
-
-    # جلب آخر 1000 رسالة
     messages = []
     async for msg in client.iter_messages(channel, limit=1000):
         if msg.text:
             messages.append(msg)
     logger.debug(f"📊 {len(messages)} رسالة نصية")
 
-    # معرفات المخزنة
     with engine.connect() as conn:
         stored = conn.execute(
             text("SELECT telegram_message_id FROM episodes WHERE telegram_channel_id = :chan"),
@@ -252,7 +357,7 @@ async def sync_channel_messages(client, channel):
                 new += 1
                 stored_set.add(msg.id)
             else:
-                # فشل الإدراج (موجود أو خطأ)
+                # تحقق إذا كان موجوداً بالفعل
                 with engine.connect() as conn2:
                     exists = conn2.execute(
                         text("SELECT 1 FROM episodes WHERE telegram_message_id = :mid"),
@@ -265,14 +370,11 @@ async def sync_channel_messages(client, channel):
                         logger.error(f"❌ فشل إدراج {msg.id}")
         else:
             failed += 1
-    logger.info(f"✅ {channel.title}: {new} جديدة, {skipped} موجودة, {failed} فشل")
+    logger.info(f"✅ {channel.title}: {new} جديدة, {skipped} موجودة, {failed} فشل تحليل")
 
 async def import_channel_history(client, channel):
-    """استيراد كل الرسائل مع التحقق المسبق"""
     channel_id = f"@{channel.username}" if channel.username else str(channel.id)
     logger.info(f"\n📂 استيراد كامل {channel.title}")
-
-    # جلب جميع الرسائل
     all_msgs = []
     async for msg in client.iter_messages(channel, limit=None):
         if msg.text:
@@ -280,7 +382,6 @@ async def import_channel_history(client, channel):
     all_msgs.reverse()
     logger.debug(f"📊 {len(all_msgs)} رسالة")
 
-    # معرفات المخزنة
     with engine.connect() as conn:
         stored = conn.execute(
             text("SELECT telegram_message_id FROM episodes WHERE telegram_channel_id = :chan"),
@@ -301,7 +402,6 @@ async def import_channel_history(client, channel):
                 new += 1
                 stored_set.add(msg.id)
             else:
-                # تحقق إضافي
                 with engine.connect() as conn2:
                     exists = conn2.execute(
                         text("SELECT 1 FROM episodes WHERE telegram_message_id = :mid"),
@@ -317,11 +417,32 @@ async def import_channel_history(client, channel):
     logger.info(f"📥 {channel.title}: {new} جديدة, {skipped} موجودة, {failed} فشل")
 
 async def check_deleted_messages(client, channel):
-    # ... (نفس الكود السابق) ...
-    pass
+    channel_id = f"@{channel.username}" if channel.username else str(channel.id)
+    logger.info(f"\n🔍 التحقق من المحذوفات في {channel.title}")
+    try:
+        with engine.connect() as conn:
+            stored = conn.execute(
+                text("SELECT telegram_message_id FROM episodes WHERE telegram_channel_id = :chan"),
+                {"chan": channel_id}
+            ).fetchall()
+        stored_ids = [r[0] for r in stored]
+        if not stored_ids:
+            return
+        current_ids = []
+        async for msg in client.iter_messages(channel, limit=1000):
+            current_ids.append(msg.id)
+        deleted = [sid for sid in stored_ids if sid not in current_ids]
+        if deleted:
+            logger.info(f"🗑️ {len(deleted)} رسالة محذوفة")
+            for mid in deleted:
+                delete_from_database(mid)
+        else:
+            logger.info("✅ لا توجد محذوفات")
+    except Exception as e:
+        logger.error(f"❌ خطأ: {e}")
 
 # ==============================
-# 7. الدالة الرئيسية
+# 6. الدالة الرئيسية
 # ==============================
 async def monitor_channels():
     logger.info(f"مراقبة {len(CHANNEL_LIST)} قناة")
