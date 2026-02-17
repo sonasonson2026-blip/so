@@ -9,7 +9,7 @@ from telegram.ext import (
 from sqlalchemy import create_engine, text
 
 # ==============================
-# 1. الإعدادات 
+# 1. الإعدادات والتكوين
 # ==============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -25,10 +25,10 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# إعداد التسجيل
+# إعداد التسجيل - رفع المستوى إلى DEBUG للتشخيص
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.DEBUG  # تغيير مؤقت للتشخيص
 )
 logger = logging.getLogger(__name__)
 
@@ -49,9 +49,7 @@ if DATABASE_URL:
 # 2. دوال المساعدة لجلب البيانات (مرتبة حسب الأحدث في الأسفل)
 # ==============================
 async def get_all_content(content_type=None):
-    """جلب جميع المحتويات مع ترتيبها بحيث الأحدث في الأسفل.
-       الترتيب يكون حسب آخر حلقة مضافة (max added_at) لكل مسلسل/فيلم.
-    """
+    """جلب جميع المحتويات مع ترتيبها بحيث الأحدث في الأسفل."""
     if not engine:
         return []
     try:
@@ -72,6 +70,7 @@ async def get_all_content(content_type=None):
             """
             result = conn.execute(text(query))
             rows = result.fetchall()
+            logger.debug(f"get_all_content: تم جلب {len(rows)} صف (النوع: {content_type})")
             return rows
     except Exception as e:
         logger.error(f"خطأ في جلب المحتويات: {e}")
@@ -86,7 +85,9 @@ async def get_content_info(series_id):
             result = conn.execute(text("""
                 SELECT id, name, type FROM series WHERE id = :series_id
             """), {"series_id": series_id})
-            return result.fetchone()
+            row = result.fetchone()
+            logger.debug(f"get_content_info: {series_id} -> {row}")
+            return row
     except Exception as e:
         logger.error(f"خطأ في جلب معلومات المحتوى {series_id}: {e}")
         return None
@@ -103,6 +104,7 @@ async def get_season_episodes(series_id, season, page=1, per_page=50):
                 WHERE series_id = :series_id AND season = :season
             """), {"series_id": series_id, "season": season})
             total_episodes = count_result.scalar()
+            logger.debug(f"get_season_episodes: series_id={series_id}, season={season}, total={total_episodes}")
 
             total_pages = (total_episodes + per_page - 1) // per_page if total_episodes > 0 else 0
 
@@ -128,6 +130,7 @@ async def get_season_episodes(series_id, season, page=1, per_page=50):
             })
 
             episodes = result.fetchall()
+            logger.debug(f"get_season_episodes: تم جلب {len(episodes)} حلقة للصفحة {page}")
             return episodes, total_episodes, total_pages, page
     except Exception as e:
         logger.error(f"خطأ في get_season_episodes: {e}")
@@ -146,7 +149,9 @@ async def get_movie_parts(series_id):
                 GROUP BY season
                 ORDER BY season ASC
             """), {"series_id": series_id})
-            return result.fetchall()
+            rows = result.fetchall()
+            logger.debug(f"get_movie_parts: series_id={series_id}, parts={rows}")
+            return rows
     except Exception as e:
         logger.error(f"خطأ في get_movie_parts: {e}")
         return []
@@ -346,6 +351,7 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
                     GROUP BY season
                     ORDER BY season
                 """), {"series_id": content_id}).fetchall()
+            logger.info(f"show_content_details: مسلسل {name} (ID:{content_id}) - المواسم: {seasons}")
             if not seasons:
                 message_text += "📭 لا توجد حلقات لهذا المسلسل حالياً."
                 keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data="series_list")])
@@ -362,6 +368,7 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
         else:  # movie
             parts = await get_movie_parts(content_id)
+            logger.info(f"show_content_details: فيلم {name} (ID:{content_id}) - الأجزاء: {parts}")
             if not parts:
                 message_text += "📭 لا توجد أجزاء لهذا الفيلم حالياً."
                 keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data="movies_list")])
