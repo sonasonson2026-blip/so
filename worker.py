@@ -1,6 +1,3 @@
-# ==============================
-# worker.py (الكود الكامل)
-# ==============================
 import os
 import asyncio
 import re
@@ -135,12 +132,13 @@ def clean_name_for_movie(name):
 series_context = defaultdict(lambda: None)
 
 # ------------------------------
-# دالة التحليل المتقدمة
+# دالة التحليل المتقدمة (معدلة للتمييز بين مسلسل وفيلم)
 # ------------------------------
 def parse_content_info(text, channel_id, has_video):
     """
-    تحليل نص الرسالة. إذا كانت تحتوي على فيديو نحاول استخراج المعلومات.
-    إذا كانت بدون فيديو نخزن الاسم كسياق للمسلسل (إذا كان اسمًا فقط).
+    تحليل نص الرسالة.
+    - إذا كان هناك فيديو: نحاول استخراج المعلومات (مسلسل/فيلم).
+    - إذا لم يكن هناك فيديو: نخزن الاسم في السياق فقط إذا كان يبدو كاسم مسلسل.
     """
     if not text:
         return None, None, None, None
@@ -152,10 +150,14 @@ def parse_content_info(text, channel_id, has_video):
     series_keywords = ['حلقة', 'الحلقة', 'موسم', 'الموسم', 'season', 'episode']
     movie_keywords = ['فيلم', 'الجزء', 'part']
 
+    # تحديد نوع المحتوى بناءً على وجود كلمات محددة
+    is_series_word = 'مسلسل' in lower_text
+    is_movie_word = 'فيلم' in lower_text
+
     # إذا كان هناك فيديو
     if has_video:
         # محاولة التعرف على المسلسل
-        # الأنماط الشائعة
+        # الأنماط الشائعة للمسلسلات
         # 1. اسم + الموسم X + الحلقة Y
         match = re.search(r'^(.*?)\s+الموسم\s+(\d+)\s+الحلقة\s+(\d+)$', text, re.UNICODE)
         if match:
@@ -195,8 +197,9 @@ def parse_content_info(text, channel_id, has_video):
             episode = int(match.group(2))
             return name, 'series', 1, episode
 
-        # 6. إذا كان هناك كلمة "فيلم"
-        if 'فيلم' in lower_text:
+        # 6. إذا كان النص يحتوي على كلمة "فيلم"
+        if is_movie_word or any(kw in lower_text for kw in movie_keywords):
+            # فيلم
             match = re.search(r'فيلم\s+(.+?)\s+الجزء\s+(\d+)', text, re.UNICODE)
             if match:
                 name = clean_name_for_movie(match.group(1))
@@ -225,7 +228,12 @@ def parse_content_info(text, channel_id, has_video):
             logger.debug(f"استخدام السياق: {series_context[channel_id]} - م{season} ح{episode}")
             return series_context[channel_id], 'series', season, episode
 
-        # 8. نص عادي بدون كلمات مفتاحية – فيلم افتراضي
+        # 8. إذا كان النص يحتوي على كلمة "مسلسل" (حتى بدون كلمات حلقة/موسم) -> نعتبره مسلسل ولكن قد نحتاج لسياق؟ نفترض أنه بوست تعريف مع فيديو خطأ؟ نادر.
+        if is_series_word:
+            name = clean_name_for_series(text)
+            return name, 'series', 1, 1   # افتراضي
+
+        # 9. نص عادي بدون كلمات مفتاحية – فيلم افتراضي
         name = clean_name_for_movie(text)
         return name, 'movie', 1, 1
 
@@ -234,11 +242,13 @@ def parse_content_info(text, channel_id, has_video):
         # إذا كان النص لا يحتوي على كلمات مفتاحية للحلقات، قد يكون اسم مسلسل جديد
         if not any(kw in lower_text for kw in series_keywords + movie_keywords):
             # نعتبره اسماً لمسلسل (أو فيلم) سيظهر لاحقاً
-            name = clean_name_for_series(text)
-            if name:
-                series_context[channel_id] = name
-                logger.info(f"📝 تم تسجيل سياق مسلسل: {name} في {channel_id}")
-        # لا نرجع بيانات لأن هذا البوست ليس له فيديو
+            # لكن نفضل تخزينه كمسلسل إذا كان يحوي كلمة مسلسل أو لا يحوي كلمة فيلم
+            if is_series_word or (not is_movie_word and not re.search(r'\d', text)):
+                name = clean_name_for_series(text)
+                if name:
+                    series_context[channel_id] = name
+                    logger.info(f"📝 تم تسجيل سياق مسلسل: {name} في {channel_id}")
+            # لا نرجع بيانات لأن هذا البوست ليس له فيديو
         return None, None, None, None
 
 # ------------------------------
@@ -328,6 +338,22 @@ def delete_from_database(msg_id):
     except Exception as e:
         logger.error(f"❌ خطأ في الحذف: {e}")
         return False
+
+def clean_orphan_series():
+    """حذف المسلسلات/الأفلام التي ليس لها أي حلقات (تم إنشاؤها من بوست تعريف ولم تأتِ حلقات)"""
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                DELETE FROM series
+                WHERE id NOT IN (SELECT DISTINCT series_id FROM episodes)
+                RETURNING id, name, type
+            """)).fetchall()
+            if result:
+                for r in result:
+                    logger.info(f"🧹 تم حذف {r[2]} بدون حلقات: {r[1]} (ID: {r[0]})")
+                logger.info(f"✅ تم تنظيف {len(result)} مسلسل/فيلم بدون حلقات")
+    except Exception as e:
+        logger.error(f"❌ خطأ في تنظيف السلسلة اليتيمة: {e}")
 
 # ------------------------------
 # مزامنة القنوات
@@ -495,6 +521,9 @@ async def monitor_channels():
     if IMPORT_HISTORY:
         for ch in channels:
             await import_channel_history(client, ch)
+
+    # تنظيف المسلسلات بدون حلقات (اليتيمة)
+    clean_orphan_series()
 
     # فحص المحذوفات
     if CHECK_DELETED_MESSAGES:
