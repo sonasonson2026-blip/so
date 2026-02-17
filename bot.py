@@ -61,7 +61,7 @@ async def get_all_content(content_type=None):
                 query += f" WHERE s.type = '{content_type}'"
             query += """
                 GROUP BY s.id, s.name, s.type
-                ORDER BY last_msg_id DESC NULLS LAST
+                ORDER BY last_msg_id ASC NULLS LAST
             """
             result = conn.execute(text(query))
             return result.fetchall()
@@ -100,7 +100,7 @@ async def get_season_episodes(series_id, season, page=1, per_page=50):
                     SELECT id, season, episode_number, telegram_message_id, telegram_channel_id
                     FROM episodes
                     WHERE series_id = :sid AND season = :season
-                    ORDER BY episode_number DESC
+                    ORDER BY episode_number ASC
                     LIMIT :limit OFFSET :offset
                 """),
                 {"sid": series_id, "season": season, "limit": per_page, "offset": offset}
