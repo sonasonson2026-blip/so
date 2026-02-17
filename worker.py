@@ -155,7 +155,7 @@ with engine.begin() as conn:
         logger.error(f"❌ فشل تحديث الأسماء المقيسة: {e}")
 
 # ==============================
-# 5. دوال التحليل والحفظ والحذف
+# 5. دوال التحليل والحفظ والحذف (المعدلة)
 # ==============================
 def parse_content_info(message_text):
     """تحليل نص الرسالة لاستخراج المعلومات (محسّن)."""
@@ -291,7 +291,7 @@ async def get_channel_entity(client, channel_input):
         return None
 
 def save_to_database(name, content_type, season_num, episode_num, telegram_msg_id, channel_id, series_id=None):
-    """حفظ المحتوى في قاعدة البيانات مع استخدام normalized_name لدمج المتشابهات والبحث الموسع."""
+    """حفظ المحتوى في قاعدة البيانات مع التأكد من الإدراج الفعلي."""
     try:
         with engine.begin() as conn:
             if not series_id:
@@ -306,15 +306,15 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                 ).fetchone()
 
                 if not result:
-                    # 2. إذا لم نجد، نبحث عن أي مسلسل بنفس الاسم (دون تطبيع) باستخدام ILIKE
+                    # 2. إذا لم نجد، نبحث عن أي مسلسل بنفس الاسم (أول 3 كلمات) باستخدام ILIKE
                     logger.debug(f"لم نجد normalized_name، نبحث في الأسماء المشابهة...")
-                    # نأخذ الكلمات الرئيسية من الاسم (أول 3 كلمات) لتجنب العشوائية
                     words = name.split()[:3]
-                    like_pattern = '%' + '%'.join(words) + '%'
-                    result = conn.execute(
-                        text("SELECT id FROM series WHERE name ILIKE :pattern AND type = :type LIMIT 1"),
-                        {"pattern": like_pattern, "type": content_type}
-                    ).fetchone()
+                    if words:
+                        like_pattern = '%' + '%'.join(words) + '%'
+                        result = conn.execute(
+                            text("SELECT id FROM series WHERE name ILIKE :pattern AND type = :type LIMIT 1"),
+                            {"pattern": like_pattern, "type": content_type}
+                        ).fetchone()
 
                 if not result:
                     # 3. لا يوجد مسلسل مشابه، ننشئ جديداً
@@ -323,7 +323,6 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                         text("INSERT INTO series (name, normalized_name, type) VALUES (:name, :norm, :type)"),
                         {"name": name, "norm": normalized, "type": content_type}
                     )
-                    # الحصول على id الجديد
                     result = conn.execute(
                         text("SELECT id FROM series WHERE normalized_name = :norm AND type = :type"),
                         {"norm": normalized, "type": content_type}
@@ -332,13 +331,14 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                 series_id = result[0]
                 logger.debug(f"تم العثور على series_id={series_id}")
 
-            # إدراج الحلقة (مع added_at التلقائي)
-            conn.execute(
+            # محاولة إدراج الحلقة مع RETURNING id للتأكد من الإدراج
+            inserted = conn.execute(
                 text("""
                     INSERT INTO episodes (series_id, season, episode_number, 
                            telegram_message_id, telegram_channel_id)
                     VALUES (:sid, :season, :ep_num, :msg_id, :channel)
                     ON CONFLICT (telegram_message_id) DO NOTHING
+                    RETURNING id
                 """),
                 {
                     "sid": series_id,
@@ -347,9 +347,14 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                     "msg_id": telegram_msg_id,
                     "channel": channel_id
                 }
-            )
+            ).fetchone()
 
-        # تسجيل الإضافة الجديدة (مهم)
+            if inserted is None:
+                # لم يتم الإدراج (موجود مسبقاً)
+                logger.debug(f"⚠️ الحلقة موجودة مسبقاً: {telegram_msg_id}")
+                return False
+
+        # تم الإدراج بنجاح
         type_arabic = "مسلسل" if content_type == 'series' else "فيلم"
         if content_type == 'movie':
             logger.info(f"✅ فيلم جديد: {name} - الجزء {season_num} من {channel_id}")
@@ -430,6 +435,7 @@ async def sync_channel_messages(client, channel):
     new_count = 0
     skipped_count = 0
     failed_parse_count = 0
+    conflict_count = 0
 
     for msg in messages:
         if msg.id in stored_ids_set:
@@ -438,17 +444,29 @@ async def sync_channel_messages(client, channel):
 
         name, content_type, season, episode = parse_content_info(msg.text)
         if name and content_type and episode is not None:
-            if save_to_database(name, content_type, season, episode, msg.id, channel_id):
+            success = save_to_database(name, content_type, season, episode, msg.id, channel_id)
+            if success:
                 new_count += 1
                 stored_ids_set.add(msg.id)
             else:
-                failed_parse_count += 1
+                # فشل الحفظ – تحقق ما إذا كان موجوداً مسبقاً
+                with engine.connect() as conn2:
+                    exists = conn2.execute(
+                        text("SELECT 1 FROM episodes WHERE telegram_message_id = :msg_id"),
+                        {"msg_id": msg.id}
+                    ).scalar()
+                    if exists:
+                        conflict_count += 1
+                        logger.debug(f"⚠️ رسالة {msg.id} موجودة مسبقاً رغم عدم وجودها في stored_ids_set؟ (تحديث)")
+                    else:
+                        failed_parse_count += 1
+                        logger.error(f"❌ فشل إدراج الحلقة {msg.id} رغم عدم وجودها!")
         else:
             if DEBUG_MODE:
                 logger.debug(f"⚠️ لم يتم تحليل الرسالة {msg.id}: {msg.text[:50]}...")
             failed_parse_count += 1
 
-    logger.info(f"✅ مزامنة {channel.title} اكتملت: {new_count} جديدة، {skipped_count} موجودة، {failed_parse_count} فشل تحليل.")
+    logger.info(f"✅ مزامنة {channel.title} اكتملت: {new_count} جديدة، {skipped_count} موجودة، {conflict_count} تعارض، {failed_parse_count} فشل تحليل.")
 
 async def import_channel_history(client, channel):
     """استيراد جميع الرسائل القديمة (بدون حد)."""
