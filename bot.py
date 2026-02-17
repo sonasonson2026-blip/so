@@ -187,8 +187,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /test - اختبار قاعدة البيانات
 /debug - فحص تفاصيل مسلسل/فيلم
 /debug_movies - عرض قائمة الأفلام مع المعرفات
-/find <كلمة> - البحث عن مسلسل/فيلم بالاسم
-        """
+/find &lt;كلمة&gt; - البحث عن مسلسل/فيلم بالاسم
+"""
 
         if update.callback_query:
             await update.callback_query.edit_message_text(
