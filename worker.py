@@ -56,7 +56,7 @@ except Exception as e:
     sys.exit(1)
 
 # ==============================
-# 3. دوال مساعدة للتطبيع والتنظيف (تُعرف قبل استخدامها)
+# 3. دوال مساعدة للتطبيع والتنظيف
 # ==============================
 def normalize_arabic(text):
     """إزالة التشكيل والحركات وتوحيد أشكال الألف."""
@@ -103,11 +103,11 @@ def clean_name_for_movie(name):
     return name
 
 # ==============================
-# 4. إنشاء الجداول وتحديثها (بشكل تدريجي)
+# 4. إنشاء الجداول وتحديثها
 # ==============================
 try:
     with engine.begin() as conn:
-        # 1. إنشاء جدول series إذا لم يكن موجوداً (بدون normalized_name)
+        # جدول series
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS series (
                 id SERIAL PRIMARY KEY,
@@ -116,7 +116,7 @@ try:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        # 2. إنشاء جدول episodes
+        # جدول episodes
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS episodes (
                 id SERIAL PRIMARY KEY,
@@ -128,11 +128,11 @@ try:
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        # 3. إضافة عمود normalized_name إذا لم يكن موجوداً
+        # إضافة عمود normalized_name إذا لم يكن موجوداً
         conn.execute(text("""
             ALTER TABLE series ADD COLUMN IF NOT EXISTS normalized_name VARCHAR(255)
         """))
-        # 4. إنشاء الفهارس
+        # الفهارس
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_series_normalized_name ON series(normalized_name)"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_series_name_type ON series(name, type)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_telegram_msg_id ON episodes(telegram_message_id)"))
@@ -142,7 +142,7 @@ try:
 except Exception as e:
     logger.warning(f"⚠️ ملاحظة حول الجداول: {e}")
 
-# 5. تحديث الأسماء المقيسة للصفوف القديمة (تتم مرة واحدة بعد إضافة العمود)
+# تحديث الأسماء المقيسة للصفوف القديمة
 with engine.begin() as conn:
     try:
         rows = conn.execute(text("SELECT id, name FROM series WHERE normalized_name IS NULL")).fetchall()
@@ -291,20 +291,34 @@ async def get_channel_entity(client, channel_input):
         return None
 
 def save_to_database(name, content_type, season_num, episode_num, telegram_msg_id, channel_id, series_id=None):
-    """حفظ المحتوى في قاعدة البيانات مع استخدام normalized_name لدمج المتشابهات."""
+    """حفظ المحتوى في قاعدة البيانات مع استخدام normalized_name لدمج المتشابهات والبحث الموسع."""
     try:
         with engine.begin() as conn:
             if not series_id:
                 # حساب الاسم المقيس
                 normalized = normalize_series_name(name)
-                # البحث باستخدام الاسم المقيس
+                logger.debug(f"محاولة حفظ: name={name}, normalized={normalized}, type={content_type}")
+
+                # 1. البحث باستخدام normalized_name أولاً
                 result = conn.execute(
                     text("SELECT id FROM series WHERE normalized_name = :norm AND type = :type"),
                     {"norm": normalized, "type": content_type}
                 ).fetchone()
 
                 if not result:
-                    # إدخال جديد مع الاسم الأصلي والمقيس
+                    # 2. إذا لم نجد، نبحث عن أي مسلسل بنفس الاسم (دون تطبيع) باستخدام ILIKE
+                    logger.debug(f"لم نجد normalized_name، نبحث في الأسماء المشابهة...")
+                    # نأخذ الكلمات الرئيسية من الاسم (أول 3 كلمات) لتجنب العشوائية
+                    words = name.split()[:3]
+                    like_pattern = '%' + '%'.join(words) + '%'
+                    result = conn.execute(
+                        text("SELECT id FROM series WHERE name ILIKE :pattern AND type = :type LIMIT 1"),
+                        {"pattern": like_pattern, "type": content_type}
+                    ).fetchone()
+
+                if not result:
+                    # 3. لا يوجد مسلسل مشابه، ننشئ جديداً
+                    logger.debug(f"لم نجد أي مسلسل مشابه، سيتم إنشاء مسلسل جديد.")
                     conn.execute(
                         text("INSERT INTO series (name, normalized_name, type) VALUES (:name, :norm, :type)"),
                         {"name": name, "norm": normalized, "type": content_type}
@@ -316,6 +330,7 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                     ).fetchone()
 
                 series_id = result[0]
+                logger.debug(f"تم العثور على series_id={series_id}")
 
             # إدراج الحلقة (مع added_at التلقائي)
             conn.execute(
