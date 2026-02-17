@@ -696,10 +696,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.")
 
 # ==============================
+async def debug_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تشخيص عدد حلقات موسم معين."""
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("استخدم: /debug_season <series_id> <season>")
+        return
+    try:
+        series_id = int(context.args[0])
+        season = int(context.args[1])
+        with engine.connect() as conn:
+            # عدد الحلقات في الموسم
+            count = conn.execute(
+                text("SELECT COUNT(*) FROM episodes WHERE series_id = :sid AND season = :season"),
+                {"sid": series_id, "season": season}
+            ).scalar()
+            # عينة من الحلقات
+            episodes = conn.execute(
+                text("SELECT episode_number, telegram_message_id, telegram_channel_id, added_at FROM episodes WHERE series_id = :sid AND season = :season ORDER BY episode_number"),
+                {"sid": series_id, "season": season}
+            ).fetchall()
+            if count == 0:
+                await update.message.reply_text(f"لا توجد حلقات للمسلسل {series_id} في الموسم {season}")
+                return
+            # أرقام الحلقات
+            ep_numbers = [ep[0] for ep in episodes]
+            min_ep = min(ep_numbers)
+            max_ep = max(ep_numbers)
+            text = f"🔍 **المسلسل ID {series_id} - الموسم {season}**\n"
+            text += f"إجمالي الحلقات: {count}\n"
+            text += f"أصغر رقم حلقة: {min_ep}\n"
+            text += f"أكبر رقم حلقة: {max_ep}\n"
+            text += f"أول 20 رقم: {', '.join(map(str, ep_numbers[:20]))}"
+            if len(ep_numbers) > 20:
+                text += f"... (و{len(ep_numbers)-20} أخرى)"
+            await update.message.reply_text(text, parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"خطأ: {e}")
 # 10. الدالة الرئيسية
 # ==============================
 def main():
     try:
+        app.add_handler(CommandHandler("debug_season", debug_season))
         app = Application.builder().token(BOT_TOKEN).build()
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("series", series_command))
