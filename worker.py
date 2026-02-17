@@ -404,7 +404,7 @@ async def sync_channel_messages(client, channel):
 
     # جلب آخر 1000 رسالة
     messages = []
-    async for msg in client.iter_messages(channel, limit=1000):
+    async for msg in client.iter_messages(channel, limit=1500):
         if msg.text:
             messages.append(msg)
     messages.reverse()  # أقدم أولاً لبناء السياق
