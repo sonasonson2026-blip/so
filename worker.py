@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 # ==============================
-# 1. إعدادات التهيئة من متغيرات 
+# 1. إعدادات التهيئة من متغيرات البيئة
 # ==============================
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
@@ -56,7 +56,7 @@ except Exception as e:
     sys.exit(1)
 
 # ==============================
-# 3. دوال مساعدة للتطبيع والتنظيف
+# 3. دوال مساعدة للتطبيع والتنظيف (تُعرف قبل استخدامها)
 # ==============================
 def normalize_arabic(text):
     """إزالة التشكيل والحركات وتوحيد أشكال الألف."""
@@ -103,21 +103,20 @@ def clean_name_for_movie(name):
     return name
 
 # ==============================
-# 4. إنشاء الجداول وتحديثها
+# 4. إنشاء الجداول وتحديثها (بشكل تدريجي)
 # ==============================
 try:
     with engine.begin() as conn:
-        # جدول series
+        # 1. إنشاء جدول series إذا لم يكن موجوداً (بدون normalized_name)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS series (
                 id SERIAL PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
-                normalized_name VARCHAR(255),
                 type VARCHAR(10) DEFAULT 'series',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        # جدول episodes
+        # 2. إنشاء جدول episodes
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS episodes (
                 id SERIAL PRIMARY KEY,
@@ -129,24 +128,31 @@ try:
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        # الفهارس
+        # 3. إضافة عمود normalized_name إذا لم يكن موجوداً
+        conn.execute(text("""
+            ALTER TABLE series ADD COLUMN IF NOT EXISTS normalized_name VARCHAR(255)
+        """))
+        # 4. إنشاء الفهارس
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_series_normalized_name ON series(normalized_name)"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_series_name_type ON series(name, type)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_telegram_msg_id ON episodes(telegram_message_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_channel_id ON episodes(telegram_channel_id)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_added_at ON episodes(added_at)"))  # للترتيب
-
-        # تحديث الأسماء المقيسة للحقول الفارغة (باستخدام بايثون خارج المعاملة)
-    logger.info("✅ تم التحقق من هياكل الجداول.")
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_added_at ON episodes(added_at)"))
+    logger.info("✅ تم التحقق من هياكل الجداول وتحديثها.")
 except Exception as e:
     logger.warning(f"⚠️ ملاحظة حول الجداول: {e}")
 
-# تحديث الأسماء المقيسة للصفوف القديمة (تتم مرة واحدة)
+# 5. تحديث الأسماء المقيسة للصفوف القديمة (تتم مرة واحدة بعد إضافة العمود)
 with engine.begin() as conn:
-    rows = conn.execute(text("SELECT id, name FROM series WHERE normalized_name IS NULL")).fetchall()
-    for row in rows:
-        norm = normalize_series_name(row[1])
-        conn.execute(text("UPDATE series SET normalized_name = :norm WHERE id = :id"), {"norm": norm, "id": row[0]})
+    try:
+        rows = conn.execute(text("SELECT id, name FROM series WHERE normalized_name IS NULL")).fetchall()
+        for row in rows:
+            norm = normalize_series_name(row[1])
+            conn.execute(text("UPDATE series SET normalized_name = :norm WHERE id = :id"), {"norm": norm, "id": row[0]})
+        if rows:
+            logger.info(f"✅ تم تحديث {len(rows)} اسماً مقيساً.")
+    except Exception as e:
+        logger.error(f"❌ فشل تحديث الأسماء المقيسة: {e}")
 
 # ==============================
 # 5. دوال التحليل والحفظ والحذف
