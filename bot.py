@@ -1,5 +1,5 @@
 # ==============================
-# bot.py (الكود الكامل مع تحسينات التصفح)
+# bot.py (نسخة معدلة لدمج المسلسلات)
 # ==============================
 import os
 import logging
@@ -94,48 +94,61 @@ async def get_content_info(series_id):
         logger.error(f"خطأ في جلب معلومات المحتوى {series_id}: {e}")
         return None
 
-async def get_season_episodes(series_id, season, page=1, per_page=50):
+async def get_similar_series(name):
+    """البحث عن جميع المسلسلات المشابهة لاسم معين"""
     if not engine:
-        return [], 0, 0, page
+        return []
     try:
         with engine.connect() as conn:
-            total = conn.execute(
+            # نحول الاسم إلى صيغة موحدة للبحث
+            words = name.split()[:3]
+            pattern = '%' + '%'.join(words) + '%'
+            result = conn.execute(
+                text("SELECT id, name FROM series WHERE name ILIKE :pat ORDER BY id"),
+                {"pat": pattern}
+            ).fetchall()
+            return result
+    except Exception as e:
+        logger.error(f"خطأ في البحث عن مسلسلات مشابهة: {e}")
+        return []
+
+async def get_consolidated_episodes(series_ids, season):
+    """جمع كل الحلقات من عدة مسلسلات لنفس الموسم"""
+    all_episodes = []
+    total = 0
+    for sid in series_ids:
+        with engine.connect() as conn:
+            cnt = conn.execute(
                 text("SELECT COUNT(*) FROM episodes WHERE series_id = :sid AND season = :season"),
-                {"sid": series_id, "season": season}
+                {"sid": sid, "season": season}
             ).scalar()
-            total_pages = (total + per_page - 1) // per_page if total else 0
-            if page < 1:
-                page = 1
-            elif page > total_pages:
-                page = total_pages
-            offset = (page - 1) * per_page
-            episodes = conn.execute(
+            total += cnt
+            eps = conn.execute(
                 text("""
                     SELECT id, season, episode_number, telegram_message_id, telegram_channel_id
                     FROM episodes
                     WHERE series_id = :sid AND season = :season
                     ORDER BY episode_number ASC
-                    LIMIT :limit OFFSET :offset
                 """),
-                {"sid": series_id, "season": season, "limit": per_page, "offset": offset}
+                {"sid": sid, "season": season}
             ).fetchall()
-            return episodes, total, total_pages, page
-    except Exception as e:
-        logger.error(f"خطأ في get_season_episodes: {e}")
-        return [], 0, 0, page
+            all_episodes.extend(eps)
+    # ترتيب تصاعدي حسب رقم الحلقة
+    all_episodes.sort(key=lambda x: x[2])
+    return all_episodes, total
 
-async def get_movie_parts(series_id):
-    if not engine:
-        return []
-    try:
+async def get_consolidated_seasons(series_ids):
+    """جمع المواسم من عدة مسلسلات"""
+    seasons = {}
+    for sid in series_ids:
         with engine.connect() as conn:
-            return conn.execute(
-                text("SELECT season, COUNT(*) FROM episodes WHERE series_id = :sid GROUP BY season ORDER BY season"),
-                {"sid": series_id}
+            rows = conn.execute(
+                text("SELECT season, COUNT(*) FROM episodes WHERE series_id = :sid GROUP BY season"),
+                {"sid": sid}
             ).fetchall()
-    except Exception as e:
-        logger.error(f"خطأ في get_movie_parts: {e}")
-        return []
+            for s, c in rows:
+                seasons[s] = seasons.get(s, 0) + c
+    return sorted(seasons.items())
 
 # ------------------------------
 # أوامر البوت
@@ -226,7 +239,7 @@ async def movies_command(update, context):
 async def all_command(update, context):
     await show_content(update, context, None, 1)
 
-async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYPE, content_id, page=1):
+async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYPE, content_id):
     query = update.callback_query
     info = await get_content_info(content_id)
     if not info:
@@ -234,22 +247,32 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     sid, name, typ = info
 
+    # البحث عن جميع المسلسلات المشابهة (نفس الاسم تقريباً)
+    similar = await get_similar_series(name)
+    all_ids = [sid] + [s[0] for s in similar if s[0] != sid]
+    all_ids = list(set(all_ids))  # إزالة التكرار
+
+    # حفظ القائمة في context لاستخدامها لاحقاً
+    context.user_data['current_series_ids'] = all_ids
+    context.user_data['current_name'] = name
+    context.user_data['current_type'] = typ
+
     # جلب القنوات
-    with engine.connect() as conn:
-        channels = conn.execute(
-            text("SELECT DISTINCT telegram_channel_id FROM episodes WHERE series_id = :sid"),
-            {"sid": sid}
-        ).fetchall()
-    chan_text = ", ".join([c[0] for c in channels]) if channels else "غير معروف"
+    channels = set()
+    for sid in all_ids:
+        with engine.connect() as conn:
+            chs = conn.execute(
+                text("SELECT DISTINCT telegram_channel_id FROM episodes WHERE series_id = :sid"),
+                {"sid": sid}
+            ).fetchall()
+            for ch in chs:
+                channels.add(ch[0])
+    chan_text = ", ".join(channels) if channels else "غير معروف"
 
     msg = f"<b>{name}</b>\n<b>القنوات:</b> {chan_text}\n\n"
 
     if typ == 'series':
-        with engine.connect() as conn:
-            seasons = conn.execute(
-                text("SELECT season, COUNT(*) FROM episodes WHERE series_id = :sid GROUP BY season ORDER BY season"),
-                {"sid": sid}
-            ).fetchall()
+        seasons = await get_consolidated_seasons(all_ids)
         if not seasons:
             msg += "📭 لا توجد حلقات"
             keyboard = [[InlineKeyboardButton("⬅️ رجوع", callback_data="series_list_1")]]
@@ -257,13 +280,26 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         if len(seasons) > 1:
             msg += "اختر الموسم:"
-            keyboard = [[InlineKeyboardButton(f"الموسم {s} ({c} حلقة)", callback_data=f"season_{sid}_{s}")] for s, c in seasons]
+            keyboard = []
+            for s, c in seasons:
+                keyboard.append([InlineKeyboardButton(f"الموسم {s} ({c} حلقة)", callback_data=f"season_{s}")])
         else:
             season = seasons[0][0]
-            await show_season_episodes(update, context, sid, season, page)
+            # عرض الحلقات مباشرة
+            await show_season_episodes(update, context, season, 1)
             return
     else:  # فيلم
-        parts = await get_movie_parts(sid)
+        # تجميع الأجزاء
+        parts = {}
+        for sid in all_ids:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("SELECT season, COUNT(*) FROM episodes WHERE series_id = :sid GROUP BY season"),
+                    {"sid": sid}
+                ).fetchall()
+                for p, c in rows:
+                    parts[p] = parts.get(p, 0) + c
+        parts = sorted(parts.items())
         if not parts:
             msg += "📭 لا توجد أجزاء"
             keyboard = [[InlineKeyboardButton("⬅️ رجوع", callback_data="movies_list_1")]]
@@ -273,47 +309,70 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
             msg += "اختر الجزء:"
             keyboard = []
             for p, _ in parts:
+                # نأخذ أول حلقة من هذا الجزء (أي جزء)
+                ep_id = None
+                for sid in all_ids:
+                    with engine.connect() as conn:
+                        ep_id = conn.execute(
+                            text("SELECT id FROM episodes WHERE series_id = :sid AND season = :p LIMIT 1"),
+                            {"sid": sid, "p": p}
+                        ).scalar()
+                        if ep_id:
+                            break
+                if ep_id:
+                    keyboard.append([InlineKeyboardButton(f"الجزء {p}", callback_data=f"ep_{ep_id}")])
+        else:
+            p = parts[0][0]
+            ep_id = None
+            for sid in all_ids:
                 with engine.connect() as conn:
                     ep_id = conn.execute(
                         text("SELECT id FROM episodes WHERE series_id = :sid AND season = :p LIMIT 1"),
                         {"sid": sid, "p": p}
                     ).scalar()
-                keyboard.append([InlineKeyboardButton(f"الجزء {p}", callback_data=f"ep_{ep_id}")])
-        else:
-            p = parts[0][0]
-            with engine.connect() as conn:
-                ep_id = conn.execute(
-                    text("SELECT id FROM episodes WHERE series_id = :sid AND season = :p LIMIT 1"),
-                    {"sid": sid, "p": p}
-                ).scalar()
-            msg += "اضغط لمشاهدة الفيلم:"
-            keyboard = [[InlineKeyboardButton("مشاهدة", callback_data=f"ep_{ep_id}")]]
+                    if ep_id:
+                        break
+            if ep_id:
+                msg += "اضغط لمشاهدة الفيلم:"
+                keyboard = [[InlineKeyboardButton("مشاهدة", callback_data=f"ep_{ep_id}")]]
+            else:
+                msg += "لا يوجد رابط"
+                keyboard = []
 
     keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"{'series' if typ=='series' else 'movies'}_list_1"), 
                      InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
     await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYPE, sid, season, page=1):
+async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYPE, season, page=1):
     query = update.callback_query
-    info = await get_content_info(sid)
-    if not info:
-        await query.edit_message_text("❌ المحتوى غير موجود")
+    all_ids = context.user_data.get('current_series_ids', [])
+    name = context.user_data.get('current_name', '')
+    if not all_ids:
+        await query.edit_message_text("❌ جلسة منتهية، الرجاء العودة للقائمة الرئيسية")
         return
-    name = info[1]
 
-    episodes, total, total_pages, current_page = await get_season_episodes(sid, season, page)
-    if not episodes:
+    episodes, total = await get_consolidated_episodes(all_ids, season)
+    per_page = 50
+    total_pages = (total + per_page - 1) // per_page if total else 0
+    if page < 1:
+        page = 1
+    elif page > total_pages:
+        page = total_pages
+    offset = (page - 1) * per_page
+    episodes_page = episodes[offset:offset+per_page]
+
+    if not episodes_page:
         await query.edit_message_text(f"❌ لا توجد حلقات للموسم {season}")
         return
 
     msg = f"<b>{name}</b>\nالموسم {season}\nعدد الحلقات: {total}\n"
     if total_pages > 1:
-        msg += f"الصفحة {current_page} من {total_pages}\n\n"
+        msg += f"الصفحة {page} من {total_pages}\n\n"
     msg += "اختر الحلقة:"
 
     keyboard = []
     row = []
-    for ep in episodes:
+    for ep in episodes_page:
         eid, _, num, _, _ = ep
         row.append(InlineKeyboardButton(f"ح{num}", callback_data=f"ep_{eid}"))
         if len(row) == 5:
@@ -324,14 +383,14 @@ async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if total_pages > 1:
         nav = []
-        if current_page > 1:
-            nav.append(InlineKeyboardButton("⬅️", callback_data=f"season_page_{sid}_{season}_{current_page-1}"))
-        nav.append(InlineKeyboardButton(f"📄 {current_page}/{total_pages}", callback_data="page_info"))
-        if current_page < total_pages:
-            nav.append(InlineKeyboardButton("➡️", callback_data=f"season_page_{sid}_{season}_{current_page+1}"))
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"season_page_{season}_{page-1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="page_info"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"season_page_{season}_{page+1}"))
         keyboard.append(nav)
 
-    keyboard.append([InlineKeyboardButton("⬅️ رجوع للمسلسل", callback_data=f"content_{sid}"), 
+    keyboard.append([InlineKeyboardButton("⬅️ رجوع للمسلسل", callback_data=f"content_{all_ids[0]}"), 
                      InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
     await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -430,12 +489,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_episode_details(update, context, eid)
     elif data.startswith('season_page_'):
         parts = data.split('_')
-        sid, season, page = int(parts[2]), int(parts[3]), int(parts[4])
-        await show_season_episodes(update, context, sid, season, page)
+        season = int(parts[2])
+        page = int(parts[3])
+        await show_season_episodes(update, context, season, page)
     elif data.startswith('season_'):
-        parts = data.split('_')
-        sid, season = int(parts[1]), int(parts[2])
-        await show_season_episodes(update, context, sid, season, 1)
+        season = int(data.split('_')[1])
+        await show_season_episodes(update, context, season, 1)
     elif data == 'page_info':
         await query.answer("استخدم أزرار التنقل", show_alert=False)
 
