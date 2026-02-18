@@ -1,5 +1,5 @@
 # ==============================
-# bot.py (نسخة نهائية مع دمج ذكي)
+# bot.py (نسخة نهائية مع دمج دقيق باستخدام normalized_name)
 # ==============================
 import os
 import logging
@@ -42,7 +42,7 @@ if DATABASE_URL:
         engine = None
 
 # ------------------------------
-# دوال تطبيع النص (مطابقة لما في worker)
+# دوال تطبيع النص (للتأكد)
 # ------------------------------
 def normalize_arabic(text):
     if not text:
@@ -64,31 +64,38 @@ def normalize_series_name(name):
     return name
 
 # ------------------------------
-# دوال مساعدة للبحث والدمج
+# دوال مساعدة للدمج باستخدام normalized_name
 # ------------------------------
-async def get_all_series_by_keywords(name, content_type=None):
-    """البحث عن جميع المسلسلات التي تبدأ بنفس الكلمات المفتاحية"""
+async def get_all_series_by_normalized_name(normalized_name, content_type=None):
+    """البحث عن جميع المسلسلات التي لها نفس normalized_name"""
     if not engine:
         return []
     try:
-        # استخراج أول 3 كلمات من الاسم (بدون أرقام)
-        words = re.sub(r'\d+', '', name).split()[:3]
-        if not words:
-            return []
-        # بناء pattern للبحث: %كلمة1%كلمة2%كلمة3%
-        pattern = '%' + '%'.join(words) + '%'
-        
         with engine.connect() as conn:
-            query = "SELECT id, name, type FROM series WHERE name ILIKE :pat"
-            params = {"pat": pattern}
+            query = "SELECT id, name, type FROM series WHERE normalized_name = :norm"
+            params = {"norm": normalized_name}
             if content_type:
                 query += " AND type = :typ"
                 params["typ"] = content_type
             result = conn.execute(text(query), params).fetchall()
+            logger.info(f"عدد المسلسلات بنفس normalized_name '{normalized_name}': {len(result)}")
             return result
     except Exception as e:
         logger.error(f"خطأ في البحث عن مسلسلات مشابهة: {e}")
         return []
+
+async def get_normalized_name_for_series(series_id):
+    """الحصول على normalized_name لمسلسل معين"""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT normalized_name FROM series WHERE id = :sid"),
+                {"sid": series_id}
+            ).scalar()
+            return result
+    except Exception as e:
+        logger.error(f"خطأ في جلب normalized_name: {e}")
+        return None
 
 async def get_all_episodes_for_series(series_ids):
     """جلب جميع الحلقات من عدة مسلسلات، مرتبة حسب الموسم ورقم الحلقة"""
@@ -96,7 +103,6 @@ async def get_all_episodes_for_series(series_ids):
         return []
     try:
         with engine.connect() as conn:
-            # تحويل list إلى tuple للاستعلام
             ids_tuple = tuple(series_ids)
             result = conn.execute(
                 text("""
@@ -107,6 +113,7 @@ async def get_all_episodes_for_series(series_ids):
                 """),
                 {"ids": ids_tuple}
             ).fetchall()
+            logger.info(f"تم جلب {len(result)} حلقة من {len(series_ids)} مسلسل")
             return result
     except Exception as e:
         logger.error(f"خطأ في جلب الحلقات: {e}")
@@ -249,19 +256,20 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
     # الحصول على معلومات المسلسل المختار
     with engine.connect() as conn:
         row = conn.execute(
-            text("SELECT id, name, type FROM series WHERE id = :sid"),
+            text("SELECT id, name, type, normalized_name FROM series WHERE id = :sid"),
             {"sid": content_id}
         ).fetchone()
     if not row:
         await query.edit_message_text("❌ المحتوى غير موجود")
         return
-    sid, name, typ = row
+    sid, name, typ, norm = row
 
-    # البحث عن جميع المسلسلات المشابهة (باستخدام الكلمات المفتاحية)
-    similar_series = await get_all_series_by_keywords(name, typ)
+    # البحث عن جميع المسلسلات المشابهة باستخدام normalized_name
+    similar_series = await get_all_series_by_normalized_name(norm, typ)
     all_ids = [s[0] for s in similar_series]
     if not all_ids:
         all_ids = [sid]
+    logger.info(f"معرفات المسلسلات المجمعة: {all_ids}")
 
     # حفظ القائمة في context
     context.user_data['current_series_ids'] = all_ids
