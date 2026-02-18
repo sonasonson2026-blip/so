@@ -21,18 +21,15 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     print("⚠️ تحذير: DATABASE_URL غير موجود. قد لا تعرض المحتويات.")
 
-# إصلاح رابط قاعدة البيانات
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# إعداد التسجيل
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# محرك قاعدة البيانات
 engine = None
 if DATABASE_URL:
     try:
@@ -48,7 +45,6 @@ if DATABASE_URL:
             print(f"   - عدد المسلسلات: {series_count}")
             print(f"   - عدد الأفلام: {movies_count}")
 
-        # إنشاء فهرس لتحسين الأداء
         try:
             with engine.begin() as conn:
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_series_season ON episodes(series_id, season, episode_number)"))
@@ -61,10 +57,9 @@ if DATABASE_URL:
         engine = None
 
 # ==============================
-# 2. دوال المساعدة للتعامل مع قاعدة البيانات
+# 2. دوال المساعدة
 # ==============================
 async def get_all_content(content_type=None):
-    """جلب جميع المحتويات من قاعدة البيانات حسب النوع (مسلسلات/أفلام)"""
     if not engine:
         return []
     try:
@@ -89,7 +84,6 @@ async def get_all_content(content_type=None):
         return []
 
 async def get_content_episodes(series_id, page=1, per_page=50):
-    """جلب حلقات/أجزاء محتوى محدد مع دعم التقسيم إلى صفحات"""
     if not engine:
         return [], 0, 0
     try:
@@ -120,7 +114,6 @@ async def get_content_episodes(series_id, page=1, per_page=50):
         return [], 0, 0
 
 async def get_content_info(series_id):
-    """جلب معلومات محتوى محدد"""
     if not engine:
         return None
     try:
@@ -151,11 +144,27 @@ async def get_seasons_stats(series_id):
         logger.error(f"خطأ في جلب إحصائيات المواسم: {e}")
         return []
 
+async def get_episode_numbers_for_season(series_id, season):
+    """جلب أرقام الحلقات لموسم معين (مرتبة)"""
+    if not engine:
+        return []
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT episode_number
+                FROM episodes
+                WHERE series_id = :series_id AND season = :season
+                ORDER BY episode_number
+            """), {"series_id": series_id, "season": season})
+            return [row[0] for row in result]
+    except Exception as e:
+        logger.error(f"خطأ في جلب أرقام الحلقات: {e}")
+        return []
+
 # ==============================
 # 3. دوال البوت الرئيسية
 # ==============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر /start"""
     try:
         keyboard = [
             [InlineKeyboardButton("📺 المسلسلات", callback_data='series_list'),
@@ -179,6 +188,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /movies - عرض الأفلام
 /all - عرض كل المحتويات
 /test - اختبار قاعدة البيانات
+/debug_series <id> [season] - فحص تفاصيل مسلسل (للمطور)
         """
 
         if update.callback_query:
@@ -193,7 +203,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"خطأ في start: {e}")
 
 async def show_content(update: Update, context: ContextTypes.DEFAULT_TYPE, content_type=None):
-    """عرض المحتويات حسب النوع"""
     try:
         if not engine:
             msg = "❌ قاعدة البيانات غير متاحة حالياً."
@@ -261,7 +270,6 @@ async def all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_content(update, context)
 
 async def test_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر /test - اختبار قاعدة البيانات"""
     try:
         if not engine:
             await update.message.reply_text("❌ قاعدة البيانات غير متصلة.")
@@ -286,15 +294,105 @@ async def test_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for row in episodes_sample:
                 episodes_text += f"• ID:{row[0]} - مسلسل:{row[1]} - م{row[2]} ح{row[3]} - قناة:{row[4]}\n"
 
-        await update.message.reply_text(f"{tables_info}\n{series_text}\n{episodes_text}", parse_mode='Markdown')
+            # إحصائيات المسلسل 60 (التفاح الحرام) للمساعدة في التشخيص
+            debug_info = ""
+            try:
+                seasons_60 = await get_seasons_stats(60)
+                if seasons_60:
+                    debug_info = "\n\n📊 *تفاصيل المسلسل 60 (التفاح الحرام):*\n"
+                    for s, cnt in seasons_60:
+                        debug_info += f"   الموسم {s}: {cnt} حلقة\n"
+            except:
+                pass
+
+        await update.message.reply_text(f"{tables_info}\n{series_text}\n{episodes_text}{debug_info}", parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ خطأ في اختبار قاعدة البيانات:\n`{str(e)[:300]}`")
 
 # ==============================
-# 4. عرض تفاصيل المحتوى والمواسم والحلقات
+# 4. أوامر التصحيح (Debug)
+# ==============================
+async def debug_series_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض تفاصيل مسلسل معين: /debug_series <id> [season]"""
+    try:
+        if not engine:
+            await update.message.reply_text("❌ قاعدة البيانات غير متصلة.")
+            return
+
+        args = context.args
+        if not args:
+            await update.message.reply_text("⚠️ يرجى إدخال رقم المسلسل. مثال: `/debug_series 60`", parse_mode='Markdown')
+            return
+
+        try:
+            series_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("⚠️ رقم المسلسل يجب أن يكون رقماً صحيحاً.")
+            return
+
+        # جلب معلومات المسلسل
+        info = await get_content_info(series_id)
+        if not info:
+            await update.message.reply_text(f"❌ لا يوجد مسلسل بالرقم {series_id}.")
+            return
+        series_name = info[1]
+
+        # إذا كان هناك وسيط ثاني (رقم الموسم)
+        if len(args) >= 2:
+            try:
+                season = int(args[1])
+            except ValueError:
+                await update.message.reply_text("⚠️ رقم الموسم يجب أن يكون رقماً صحيحاً.")
+                return
+
+            # جلب أرقام الحلقات لهذا الموسم
+            episode_numbers = await get_episode_numbers_for_season(series_id, season)
+            if not episode_numbers:
+                await update.message.reply_text(f"لا توجد حلقات للموسم {season} في مسلسل {series_name}.")
+                return
+
+            # تجميع الأرقام في مجموعات لسهولة القراءة
+            groups = []
+            group = []
+            for num in episode_numbers:
+                if not group or num == group[-1] + 1:
+                    group.append(num)
+                else:
+                    groups.append(group)
+                    group = [num]
+            if group:
+                groups.append(group)
+
+            range_texts = []
+            for g in groups:
+                if len(g) == 1:
+                    range_texts.append(str(g[0]))
+                else:
+                    range_texts.append(f"{g[0]}-{g[-1]}")
+
+            msg = f"*{series_name}*\nالموسم {season}\nعدد الحلقات: {len(episode_numbers)}\n\n"
+            msg += "أرقام الحلقات:\n" + "، ".join(range_texts)
+            await update.message.reply_text(msg, parse_mode='Markdown')
+        else:
+            # عرض إحصائيات المواسم
+            seasons_stats = await get_seasons_stats(series_id)
+            if not seasons_stats:
+                await update.message.reply_text(f"لا توجد حلقات لمسلسل {series_name}.")
+                return
+
+            msg = f"*{series_name}*\nإجمالي الحلقات: {sum(cnt for _, cnt in seasons_stats)}\n\n"
+            msg += "توزيع المواسم:\n"
+            for s, cnt in seasons_stats:
+                msg += f"• الموسم {s}: {cnt} حلقة\n"
+            await update.message.reply_text(msg, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"خطأ في debug_series: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ: {str(e)[:200]}")
+
+# ==============================
+# 5. دوال عرض المحتوى التفاعلي
 # ==============================
 async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYPE, content_id, page=1):
-    """عرض تفاصيل محتوى محدد (مسلسل أو فيلم)"""
     query = update.callback_query
     try:
         content_info = await get_content_info(content_id)
@@ -370,7 +468,6 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
                         message_text += "اضغط على الزر أدناه لمشاهدة الفيلم:"
                         keyboard = [[InlineKeyboardButton("مشاهدة الفيلم", callback_data=f"ep_{ep_id}")]]
 
-                # أزرار التنقل بين الصفحات للأفلام (إذا كان هناك أكثر من صفحة)
                 if total_pages > 1:
                     nav_buttons = []
                     if page > 1:
@@ -380,7 +477,6 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
                         nav_buttons.append(InlineKeyboardButton("التالية ➡️", callback_data=f"content_page_{content_id}_{page+1}"))
                     keyboard.append(nav_buttons)
 
-        # أزرار الرجوع والرئيسية
         keyboard.append([
             InlineKeyboardButton("⬅️ رجوع", callback_data=f"{content_type}_list"),
             InlineKeyboardButton("🏠 الرئيسية", callback_data="home")
@@ -394,7 +490,6 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("⚠️ حدث خطأ أثناء جلب البيانات.")
 
 async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYPE, content_id, season_num, page=1):
-    """عرض حلقات موسم محدد لمسلسل مع دعم الصفحات"""
     query = update.callback_query
     try:
         content_info = await get_content_info(content_id)
@@ -474,7 +569,6 @@ async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("⚠️ حدث خطأ أثناء جلب البيانات.")
 
 async def show_episode_details(update: Update, context: ContextTypes.DEFAULT_TYPE, episode_id):
-    """عرض تفاصيل حلقة/جزء مع رابط"""
     query = update.callback_query
     try:
         with engine.connect() as conn:
@@ -529,11 +623,10 @@ async def show_episode_details(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("⚠️ حدث خطأ.")
 
 # ==============================
-# 5. معالج الأزرار مع تصحيح خطأ "page"
+# 6. معالج الأزرار
 # ==============================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # محاولة الإجابة مع إعادة المحاولة
     for attempt in range(3):
         try:
             await query.answer()
@@ -547,7 +640,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
     try:
-        # الأزرار الثابتة
         if data == 'home':
             await start(update, context)
         elif data == 'test_db':
@@ -558,11 +650,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_content(update, context, 'series')
         elif data == 'movies_list':
             await show_content(update, context, 'movie')
-        elif data == 'page_info' or data == 'page':   # تصحيح: التعامل مع "page" أيضًا
-            # لا تفعل شيئًا لزر معلومات الصفحة
+        elif data == 'page_info' or data == 'page':
             return
 
-        # أزرار المحتوى مع الصفحات
         elif data.startswith('content_page_'):
             parts = data.split('_')
             if len(parts) >= 4:
@@ -603,7 +693,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ حدث خطأ أثناء معالجة طلبك.")
 
 async def test_db_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """اختبار قاعدة البيانات من الزر"""
     query = update.callback_query
     try:
         if not engine:
@@ -621,6 +710,17 @@ async def test_db_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         movies_names = [row[0] for row in movies_ex] or ["لا يوجد"]
         channels_list = [row[0] for row in channels] or ["لا يوجد"]
 
+        # إحصائيات المسلسل 60
+        debug_info = ""
+        try:
+            seasons_60 = await get_seasons_stats(60)
+            if seasons_60:
+                debug_info = "\n\n📊 *تفاصيل المسلسل 60 (التفاح الحرام):*\n"
+                for s, cnt in seasons_60:
+                    debug_info += f"   الموسم {s}: {cnt} حلقة\n"
+        except:
+            pass
+
         reply = (
             f"✅ *اختبار قاعدة البيانات:*\n\n"
             f"• عدد المسلسلات: {series_count}\n"
@@ -628,7 +728,8 @@ async def test_db_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• عدد القنوات المختلفة: {len(channels_list)}\n\n"
             f"📺 *أمثلة مسلسلات:*\n" + "\n".join(f"• {n}" for n in series_names) + "\n\n"
             f"🎬 *أمثلة أفلام:*\n" + "\n".join(f"• {n}" for n in movies_names) + "\n\n"
-            f"📡 *قنوات:*\n" + "\n".join(f"• {c}" for c in channels_list)
+            f"📡 *قنوات:*\n" + "\n".join(f"• {c}" for c in channels_list) +
+            debug_info
         )
 
         keyboard = [
@@ -642,7 +743,7 @@ async def test_db_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ خطأ: {str(e)[:200]}")
 
 # ==============================
-# 6. الدالة الرئيسية
+# 7. الدالة الرئيسية
 # ==============================
 def main():
     try:
@@ -652,6 +753,7 @@ def main():
         app.add_handler(CommandHandler("movies", movies_command))
         app.add_handler(CommandHandler("all", all_command))
         app.add_handler(CommandHandler("test", test_db_command))
+        app.add_handler(CommandHandler("debug_series", debug_series_command))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("🤖 البوت يعمل...")
