@@ -1,5 +1,5 @@
 # ==============================
-# bot.py (نسخة نهائية مع دمج دقيق باستخدام normalized_name)
+# bot.py (الكود الكامل مع دمج normalized_name)
 # ==============================
 import os
 import logging
@@ -42,13 +42,13 @@ if DATABASE_URL:
         engine = None
 
 # ------------------------------
-# دوال تطبيع النص (للتأكد)
+# دوال تطبيع النص
 # ------------------------------
 def normalize_arabic(text):
     if not text:
         return ''
     text = unicodedata.normalize('NFKD', text)
-    text = re.sub(r'[\u064B-\u065F]', '', text)  # إزالة التشكيل
+    text = re.sub(r'[\u064B-\u065F]', '', text)
     text = text.replace('إ', 'ا').replace('أ', 'ا').replace('آ', 'ا').replace('ى', 'ا')
     text = text.replace('ة', 'ه')
     return text
@@ -84,19 +84,6 @@ async def get_all_series_by_normalized_name(normalized_name, content_type=None):
         logger.error(f"خطأ في البحث عن مسلسلات مشابهة: {e}")
         return []
 
-async def get_normalized_name_for_series(series_id):
-    """الحصول على normalized_name لمسلسل معين"""
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(
-                text("SELECT normalized_name FROM series WHERE id = :sid"),
-                {"sid": series_id}
-            ).scalar()
-            return result
-    except Exception as e:
-        logger.error(f"خطأ في جلب normalized_name: {e}")
-        return None
-
 async def get_all_episodes_for_series(series_ids):
     """جلب جميع الحلقات من عدة مسلسلات، مرتبة حسب الموسم ورقم الحلقة"""
     if not engine or not series_ids:
@@ -120,15 +107,13 @@ async def get_all_episodes_for_series(series_ids):
         return []
 
 # ------------------------------
-# دوال العرض (معدلة)
+# دوال العرض مع دعم الصفحات
 # ------------------------------
 async def get_all_content_paginated(content_type=None, page=1, per_page=10):
-    """جلب المحتويات مع دعم الصفحات"""
     if not engine:
         return [], 0, 0, page
     try:
         with engine.connect() as conn:
-            # حساب العدد الإجمالي
             count_query = "SELECT COUNT(DISTINCT id) FROM series"
             if content_type:
                 count_query += f" WHERE type = '{content_type}'"
@@ -152,8 +137,7 @@ async def get_all_content_paginated(content_type=None, page=1, per_page=10):
             """
             result = conn.execute(text(query), {"limit": per_page, "offset": offset})
             items = result.fetchall()
-            
-            # إحضار عدد الحلقات لكل مسلسل (للعرض فقط)
+
             items_with_count = []
             for sid, name, typ in items:
                 cnt = conn.execute(
@@ -221,7 +205,6 @@ async def show_content(update: Update, context: ContextTypes.DEFAULT_TYPE, conte
         text += f"• {name} ({info})\n"
         keyboard.append([InlineKeyboardButton(f"{name[:20]} ({ep_count})", callback_data=f"content_{sid}")])
 
-    # أزرار التنقل
     nav = []
     if current_page > 1:
         nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"{callback_prefix}_{current_page-1}"))
@@ -253,7 +236,6 @@ async def all_command(update, context):
 
 async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYPE, content_id):
     query = update.callback_query
-    # الحصول على معلومات المسلسل المختار
     with engine.connect() as conn:
         row = conn.execute(
             text("SELECT id, name, type, normalized_name FROM series WHERE id = :sid"),
@@ -264,35 +246,28 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     sid, name, typ, norm = row
 
-    # البحث عن جميع المسلسلات المشابهة باستخدام normalized_name
-    similar_series = await get_all_series_by_normalized_name(norm, typ)
-    all_ids = [s[0] for s in similar_series]
+    similar = await get_all_series_by_normalized_name(norm, typ)
+    all_ids = [s[0] for s in similar]
     if not all_ids:
         all_ids = [sid]
     logger.info(f"معرفات المسلسلات المجمعة: {all_ids}")
 
-    # حفظ القائمة في context
     context.user_data['current_series_ids'] = all_ids
     context.user_data['current_name'] = name
     context.user_data['current_type'] = typ
 
-    # جلب جميع الحلقات من هذه المسلسلات
     all_episodes = await get_all_episodes_for_series(all_ids)
     if not all_episodes:
         await query.edit_message_text(f"📭 لا توجد حلقات لهذا المحتوى")
         return
 
-    # تجميع المواسم وعدد الحلقات
     seasons = {}
     for ep in all_episodes:
-        s = ep[2]  # season
+        s = ep[2]
         seasons[s] = seasons.get(s, 0) + 1
-
-    # ترتيب المواسم
     seasons = sorted(seasons.items())
-    context.user_data['all_episodes'] = all_episodes  # نخزن كل الحلقات للاستخدام لاحقاً
+    context.user_data['all_episodes'] = all_episodes
 
-    # عرض المواسم
     msg = f"<b>{name}</b>\n\n"
     if typ == 'series':
         if len(seasons) > 1:
@@ -301,16 +276,14 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
             for s, count in seasons:
                 keyboard.append([InlineKeyboardButton(f"الموسم {s} ({count} حلقة)", callback_data=f"season_{s}_1")])
         else:
-            # موسم واحد فقط، نعرض الحلقات مباشرة
             season = seasons[0][0]
             await show_season_episodes(update, context, season, 1)
             return
-    else:  # فيلم
+    else:
         if len(seasons) > 1:
             msg += "اختر الجزء:"
             keyboard = []
             for s, count in seasons:
-                # نأخذ أول حلقة في هذا الجزء
                 ep = next((e for e in all_episodes if e[2] == s), None)
                 if ep:
                     keyboard.append([InlineKeyboardButton(f"الجزء {s}", callback_data=f"ep_{ep[0]}")])
@@ -324,7 +297,7 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
                 msg += "لا يوجد رابط"
                 keyboard = []
 
-    keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"{'series' if typ=='series' else 'movies'}_list_1"), 
+    keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"{'series' if typ=='series' else 'movies'}_list_1"),
                      InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
     await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -336,7 +309,6 @@ async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("❌ جلسة منتهية، الرجاء العودة للقائمة الرئيسية")
         return
 
-    # فلترة الحلقات حسب الموسم
     season_episodes = [ep for ep in all_episodes if ep[2] == season]
     total = len(season_episodes)
     per_page = 50
@@ -377,7 +349,7 @@ async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYP
             nav.append(InlineKeyboardButton("➡️", callback_data=f"season_page_{season}_{page+1}"))
         keyboard.append(nav)
 
-    keyboard.append([InlineKeyboardButton("⬅️ رجوع للمسلسل", callback_data=f"content_{context.user_data.get('current_series_ids', [0])[0]}"), 
+    keyboard.append([InlineKeyboardButton("⬅️ رجوع للمسلسل", callback_data=f"content_{context.user_data.get('current_series_ids', [0])[0]}"),
                      InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
     await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -416,7 +388,7 @@ async def show_episode_details(update: Update, context: ContextTypes.DEFAULT_TYP
         keyboard = []
         if link:
             keyboard.append([InlineKeyboardButton(btn_text, url=link)])
-        keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"content_{sid}"), 
+        keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"content_{sid}"),
                          InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
         await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
@@ -442,7 +414,7 @@ async def test_db_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"نماذج مسلسلات: {', '.join([r[0] for r in series_ex])}\n"
             f"نماذج أفلام: {', '.join([r[0] for r in movies_ex])}"
         )
-        keyboard = [[InlineKeyboardButton("📺 المسلسلات", callback_data="series_list_1"), 
+        keyboard = [[InlineKeyboardButton("📺 المسلسلات", callback_data="series_list_1"),
                      InlineKeyboardButton("🎬 الأفلام", callback_data="movies_list_1")],
                     [InlineKeyboardButton("🏠 الرئيسية", callback_data="home")]]
         await query.edit_message_text(reply, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
