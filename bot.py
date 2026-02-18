@@ -161,6 +161,24 @@ async def get_episode_numbers_for_season(series_id, season):
         logger.error(f"خطأ في جلب أرقام الحلقات: {e}")
         return []
 
+async def find_series_by_name(name_pattern):
+    """البحث عن مسلسلات بأسماء تحتوي على النمط"""
+    if not engine:
+        return []
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT id, name, type,
+                       (SELECT COUNT(*) FROM episodes WHERE series_id = series.id) as episode_count
+                FROM series
+                WHERE name ILIKE :pattern
+                ORDER BY name
+            """), {"pattern": f"%{name_pattern}%"})
+            return result.fetchall()
+    except Exception as e:
+        logger.error(f"خطأ في البحث عن مسلسلات: {e}")
+        return []
+
 # ==============================
 # 3. دوال البوت الرئيسية
 # ==============================
@@ -189,6 +207,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /all - عرض كل المحتويات
 /test - اختبار قاعدة البيانات
 /debug_series <id> [season] - فحص تفاصيل مسلسل (للمطور)
+/find_series <كلمة> - البحث عن مسلسلات باسم مشابه
         """
 
         if update.callback_query:
@@ -387,6 +406,35 @@ async def debug_series_command(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"خطأ في debug_series: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ: {str(e)[:200]}")
+
+async def find_series_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """البحث عن مسلسلات باسم مشابه: /find_series <كلمة>"""
+    try:
+        if not engine:
+            await update.message.reply_text("❌ قاعدة البيانات غير متصلة.")
+            return
+
+        args = context.args
+        if not args:
+            await update.message.reply_text("⚠️ يرجى إدخال كلمة للبحث. مثال: `/find_series تفاح`", parse_mode='Markdown')
+            return
+
+        name_pattern = ' '.join(args)
+        results = await find_series_by_name(name_pattern)
+
+        if not results:
+            await update.message.reply_text(f"لا توجد مسلسلات تحتوي على \"{name_pattern}\".")
+            return
+
+        msg = f"*نتائج البحث عن \"{name_pattern}\":*\n\n"
+        for row in results:
+            sid, name, stype, ep_count = row
+            msg += f"• ID: {sid} - {name} ({stype}) - {ep_count} حلقة\n"
+
+        await update.message.reply_text(msg, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"خطأ في find_series: {e}")
         await update.message.reply_text(f"❌ حدث خطأ: {str(e)[:200]}")
 
 # ==============================
@@ -754,6 +802,7 @@ def main():
         app.add_handler(CommandHandler("all", all_command))
         app.add_handler(CommandHandler("test", test_db_command))
         app.add_handler(CommandHandler("debug_series", debug_series_command))
+        app.add_handler(CommandHandler("find_series", find_series_command))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("🤖 البوت يعمل...")
