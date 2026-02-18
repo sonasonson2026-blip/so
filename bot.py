@@ -179,6 +179,24 @@ async def find_series_by_name(name_pattern):
         logger.error(f"خطأ في البحث عن مسلسلات: {e}")
         return []
 
+async def find_episode_by_msg_id(msg_id):
+    """البحث عن حلقة باستخدام معرف الرسالة"""
+    if not engine:
+        return None
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT e.id, e.series_id, s.name, e.season, e.episode_number,
+                       e.telegram_channel_id, e.telegram_message_id
+                FROM episodes e
+                JOIN series s ON e.series_id = s.id
+                WHERE e.telegram_message_id = :msg_id
+            """), {"msg_id": msg_id})
+            return result.fetchone()
+    except Exception as e:
+        logger.error(f"خطأ في البحث عن الحلقة: {e}")
+        return None
+
 # ==============================
 # 3. دوال البوت الرئيسية
 # ==============================
@@ -208,6 +226,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /test - اختبار قاعدة البيانات
 /debug_series <id> [season] - فحص تفاصيل مسلسل (للمطور)
 /find_series <كلمة> - البحث عن مسلسلات باسم مشابه
+/find_episode <msg_id> - البحث عن حلقة بمعرف الرسالة
         """
 
         if update.callback_query:
@@ -435,6 +454,44 @@ async def find_series_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"خطأ في find_series: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ: {str(e)[:200]}")
+
+async def find_episode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """البحث عن حلقة باستخدام معرف الرسالة: /find_episode <msg_id>"""
+    try:
+        if not engine:
+            await update.message.reply_text("❌ قاعدة البيانات غير متصلة.")
+            return
+
+        args = context.args
+        if not args:
+            await update.message.reply_text("⚠️ يرجى إدخال معرف الرسالة. مثال: `/find_episode 568`", parse_mode='Markdown')
+            return
+
+        try:
+            msg_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("⚠️ معرف الرسالة يجب أن يكون رقماً صحيحاً.")
+            return
+
+        episode = await find_episode_by_msg_id(msg_id)
+        if not episode:
+            await update.message.reply_text(f"لا توجد حلقة بمعرف الرسالة {msg_id}.")
+            return
+
+        ep_id, series_id, series_name, season, ep_num, channel, msg_id = episode
+        msg = (
+            f"*معلومات الحلقة:*\n\n"
+            f"• معرف الحلقة: {ep_id}\n"
+            f"• المسلسل: {series_name} (ID: {series_id})\n"
+            f"• الموسم: {season}\n"
+            f"• رقم الحلقة: {ep_num}\n"
+            f"• القناة: {channel}\n"
+            f"• معرف الرسالة: {msg_id}"
+        )
+        await update.message.reply_text(msg, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"خطأ في find_episode: {e}")
         await update.message.reply_text(f"❌ حدث خطأ: {str(e)[:200]}")
 
 # ==============================
@@ -803,6 +860,7 @@ def main():
         app.add_handler(CommandHandler("test", test_db_command))
         app.add_handler(CommandHandler("debug_series", debug_series_command))
         app.add_handler(CommandHandler("find_series", find_series_command))
+        app.add_handler(CommandHandler("find_episode", find_episode_command))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         print("🤖 البوت يعمل...")
