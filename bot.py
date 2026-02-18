@@ -1,5 +1,5 @@
 # ==============================
-# bot.py (الكود الكامل)
+# bot.py (الكود الكامل مع تحسينات التصفح)
 # ==============================
 import os
 import logging
@@ -43,13 +43,25 @@ if DATABASE_URL:
 # ------------------------------
 # دوال مساعدة
 # ------------------------------
-async def get_all_content(content_type=None):
-    """جلب المحتويات مرتبة حسب آخر رسالة (الأحدث في الأسفل)"""
+async def get_all_content_paginated(content_type=None, page=1, per_page=10):
+    """جلب المحتويات مع دعم الصفحات (كل صفحة 10 عناصر)"""
     if not engine:
-        return []
+        return [], 0, 0, page
     try:
         with engine.connect() as conn:
-            query = """
+            # حساب العدد الإجمالي
+            count_query = "SELECT COUNT(DISTINCT s.id) FROM series s"
+            if content_type:
+                count_query += f" WHERE s.type = '{content_type}'"
+            total = conn.execute(text(count_query)).scalar() or 0
+            total_pages = (total + per_page - 1) // per_page if total else 0
+            if page < 1:
+                page = 1
+            elif page > total_pages:
+                page = total_pages
+            offset = (page - 1) * per_page
+
+            query = f"""
                 SELECT s.id, s.name, s.type, 
                        COUNT(e.id) as episode_count,
                        COUNT(DISTINCT e.telegram_channel_id) as channel_count,
@@ -62,12 +74,14 @@ async def get_all_content(content_type=None):
             query += """
                 GROUP BY s.id, s.name, s.type
                 ORDER BY last_msg_id DESC NULLS LAST
+                LIMIT :limit OFFSET :offset
             """
-            result = conn.execute(text(query))
-            return result.fetchall()
+            result = conn.execute(text(query), {"limit": per_page, "offset": offset})
+            items = result.fetchall()
+            return items, total, total_pages, page
     except Exception as e:
         logger.error(f"خطأ في جلب المحتويات: {e}")
-        return []
+        return [], 0, 0, page
 
 async def get_content_info(series_id):
     if not engine:
@@ -128,9 +142,9 @@ async def get_movie_parts(series_id):
 # ------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("📺 المسلسلات", callback_data='series_list'),
-         InlineKeyboardButton("🎬 الأفلام", callback_data='movies_list')],
-        [InlineKeyboardButton("📁 جميع المحتويات", callback_data='all_content')],
+        [InlineKeyboardButton("📺 المسلسلات", callback_data='series_list_1'),
+         InlineKeyboardButton("🎬 الأفلام", callback_data='movies_list_1')],
+        [InlineKeyboardButton("📁 جميع المحتويات", callback_data='all_content_1')],
         [InlineKeyboardButton("🔄 فحص قاعدة البيانات", callback_data='test_db')],
     ]
     text = """
@@ -147,7 +161,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def show_content(update: Update, context: ContextTypes.DEFAULT_TYPE, content_type=None):
+async def show_content(update: Update, context: ContextTypes.DEFAULT_TYPE, content_type=None, page=1):
     if not engine:
         msg = "❌ قاعدة البيانات غير متاحة"
         if update.callback_query:
@@ -156,22 +170,25 @@ async def show_content(update: Update, context: ContextTypes.DEFAULT_TYPE, conte
             await update.message.reply_text(msg)
         return
 
-    items = await get_all_content(content_type)
+    items, total, total_pages, current_page = await get_all_content_paginated(content_type, page)
     if content_type == 'series':
         title = "📺 المسلسلات"
         empty = "📭 لا توجد مسلسلات"
+        callback_prefix = 'series_list'
     elif content_type == 'movie':
         title = "🎬 الأفلام"
         empty = "📭 لا توجد أفلام"
+        callback_prefix = 'movies_list'
     else:
         title = "📁 جميع المحتويات"
         empty = "📭 لا توجد محتويات"
+        callback_prefix = 'all_content'
 
     if not items:
         await (update.callback_query or update.message).reply_text(f"{empty}\n\nℹ️ استخدم زر الفحص للتحقق")
         return
 
-    text = f"<b>{title}</b>\n\n"
+    text = f"<b>{title}</b> (الصفحة {current_page}/{total_pages})\n\n"
     keyboard = []
     for row in items:
         sid, name, typ, ep_count, ch_count, _ = row
@@ -179,9 +196,19 @@ async def show_content(update: Update, context: ContextTypes.DEFAULT_TYPE, conte
         text += f"• {name} ({info})\n"
         keyboard.append([InlineKeyboardButton(f"{name[:20]} ({ep_count})", callback_data=f"content_{sid}")])
 
+    # أزرار التنقل بين الصفحات
+    nav = []
+    if current_page > 1:
+        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"{callback_prefix}_{current_page-1}"))
+    nav.append(InlineKeyboardButton(f"📄 {current_page}/{total_pages}", callback_data="page_info"))
+    if current_page < total_pages:
+        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"{callback_prefix}_{current_page+1}"))
+    if nav:
+        keyboard.append(nav)
+
     keyboard.append([
-        InlineKeyboardButton("📺 المسلسلات", callback_data='series_list'),
-        InlineKeyboardButton("🎬 الأفلام", callback_data='movies_list')
+        InlineKeyboardButton("📺 المسلسلات", callback_data='series_list_1'),
+        InlineKeyboardButton("🎬 الأفلام", callback_data='movies_list_1')
     ])
     keyboard.append([InlineKeyboardButton("🏠 الرئيسية", callback_data='home')])
 
@@ -190,9 +217,14 @@ async def show_content(update: Update, context: ContextTypes.DEFAULT_TYPE, conte
     else:
         await update.message.reply_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def series_command(update, context): await show_content(update, context, 'series')
-async def movies_command(update, context): await show_content(update, context, 'movie')
-async def all_command(update, context): await show_content(update, context)
+async def series_command(update, context):
+    await show_content(update, context, 'series', 1)
+
+async def movies_command(update, context):
+    await show_content(update, context, 'movie', 1)
+
+async def all_command(update, context):
+    await show_content(update, context, None, 1)
 
 async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYPE, content_id, page=1):
     query = update.callback_query
@@ -220,7 +252,7 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
             ).fetchall()
         if not seasons:
             msg += "📭 لا توجد حلقات"
-            keyboard = [[InlineKeyboardButton("⬅️ رجوع", callback_data="series_list")]]
+            keyboard = [[InlineKeyboardButton("⬅️ رجوع", callback_data="series_list_1")]]
             await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
             return
         if len(seasons) > 1:
@@ -234,7 +266,7 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
         parts = await get_movie_parts(sid)
         if not parts:
             msg += "📭 لا توجد أجزاء"
-            keyboard = [[InlineKeyboardButton("⬅️ رجوع", callback_data="movies_list")]]
+            keyboard = [[InlineKeyboardButton("⬅️ رجوع", callback_data="movies_list_1")]]
             await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
             return
         if len(parts) > 1:
@@ -257,7 +289,8 @@ async def show_content_details(update: Update, context: ContextTypes.DEFAULT_TYP
             msg += "اضغط لمشاهدة الفيلم:"
             keyboard = [[InlineKeyboardButton("مشاهدة", callback_data=f"ep_{ep_id}")]]
 
-    keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"{typ}_list"), InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
+    keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"{'series' if typ=='series' else 'movies'}_list_1"), 
+                     InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
     await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYPE, sid, season, page=1):
@@ -298,7 +331,8 @@ async def show_season_episodes(update: Update, context: ContextTypes.DEFAULT_TYP
             nav.append(InlineKeyboardButton("➡️", callback_data=f"season_page_{sid}_{season}_{current_page+1}"))
         keyboard.append(nav)
 
-    keyboard.append([InlineKeyboardButton("⬅️ رجوع للمسلسل", callback_data=f"content_{sid}"), InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
+    keyboard.append([InlineKeyboardButton("⬅️ رجوع للمسلسل", callback_data=f"content_{sid}"), 
+                     InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
     await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_episode_details(update: Update, context: ContextTypes.DEFAULT_TYPE, episode_id):
@@ -336,7 +370,8 @@ async def show_episode_details(update: Update, context: ContextTypes.DEFAULT_TYP
         keyboard = []
         if link:
             keyboard.append([InlineKeyboardButton(btn_text, url=link)])
-        keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"content_{sid}"), InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
+        keyboard.append([InlineKeyboardButton("⬅️ رجوع", callback_data=f"content_{sid}"), 
+                         InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
         await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"خطأ في show_episode_details: {e}")
@@ -361,7 +396,8 @@ async def test_db_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"نماذج مسلسلات: {', '.join([r[0] for r in series_ex])}\n"
             f"نماذج أفلام: {', '.join([r[0] for r in movies_ex])}"
         )
-        keyboard = [[InlineKeyboardButton("📺 المسلسلات", callback_data="series_list"), InlineKeyboardButton("🎬 الأفلام", callback_data="movies_list")],
+        keyboard = [[InlineKeyboardButton("📺 المسلسلات", callback_data="series_list_1"), 
+                     InlineKeyboardButton("🎬 الأفلام", callback_data="movies_list_1")],
                     [InlineKeyboardButton("🏠 الرئيسية", callback_data="home")]]
         await query.edit_message_text(reply, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
@@ -377,12 +413,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
     elif data == 'test_db':
         await test_db_button(update, context)
-    elif data == 'all_content':
-        await show_content(update, context)
-    elif data == 'series_list':
-        await show_content(update, context, 'series')
-    elif data == 'movies_list':
-        await show_content(update, context, 'movie')
+    elif data.startswith('series_list_'):
+        page = int(data.split('_')[2])
+        await show_content(update, context, 'series', page)
+    elif data.startswith('movies_list_'):
+        page = int(data.split('_')[2])
+        await show_content(update, context, 'movie', page)
+    elif data.startswith('all_content_'):
+        page = int(data.split('_')[2])
+        await show_content(update, context, None, page)
     elif data.startswith('content_'):
         sid = int(data.split('_')[1])
         await show_content_details(update, context, sid)
@@ -397,6 +436,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split('_')
         sid, season = int(parts[1]), int(parts[2])
         await show_season_episodes(update, context, sid, season, 1)
+    elif data == 'page_info':
+        await query.answer("استخدم أزرار التنقل", show_alert=False)
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
