@@ -75,7 +75,8 @@ try:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_series_name_type ON series(name, type)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_telegram_msg_id ON episodes(telegram_message_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_channel_id ON episodes(telegram_channel_id)"))
-    print("✅ تم التحقق من هياكل الجداول.")
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_series_season ON episodes(series_id, season, episode_number)"))
+    print("✅ تم التحقق من هياكل الجداول والفهارس.")
 except Exception as e:
     print(f"⚠️ ملاحظة حول الجداول: {e}")
 
@@ -257,7 +258,7 @@ async def get_channel_entity(client, channel_input):
         return None
 
 def save_to_database(name, content_type, season_num, episode_num, telegram_msg_id, channel_id, series_id=None):
-    """حفظ المحتوى في قاعدة البيانات مع معرف القناة."""
+    """حفظ المحتوى في قاعدة البيانات مع التحقق من نجاح الإدراج."""
     try:
         with engine.begin() as conn:
             # البحث عن المسلسل/الفيلم بنفس الاسم والنوع
@@ -291,7 +292,7 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                 series_id = result[0]
             
             # إضافة الحلقة/الجزء مع معرف القناة
-            conn.execute(
+            result = conn.execute(
                 text("""
                     INSERT INTO episodes (series_id, season, episode_number, 
                            telegram_message_id, telegram_channel_id)
@@ -306,6 +307,11 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                     "channel": channel_id
                 }
             )
+            
+            # التحقق من نجاح الإدراج (rowcount سيكون 1 إذا تم الإدراج، 0 إذا كان موجودًا مسبقًا)
+            if result.rowcount == 0:
+                print(f"⏭️ الحلقة موجودة مسبقاً: {name} - الموسم {season_num} الحلقة {episode_num} (msg_id: {telegram_msg_id})")
+                return False  # لم تتم الإضافة (موجودة مسبقاً)
             
         type_arabic = "مسلسل" if content_type == 'series' else "فيلم"
         if content_type == 'movie':
