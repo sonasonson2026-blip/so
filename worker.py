@@ -48,10 +48,11 @@ except Exception as e:
     sys.exit(1)
 
 # ==============================
-# 3. إنشاء الجداول إذا لم تكن موجودة
+# 3. إنشاء الجداول إذا لم تكن موجودة وتعديل القيود
 # ==============================
 try:
     with engine.begin() as conn:
+        # إنشاء جدول series إذا لم يكن موجوداً
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS series (
                 id SERIAL PRIMARY KEY,
@@ -60,25 +61,43 @@ try:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
+        # إنشاء جدول episodes إذا لم يكن موجوداً
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS episodes (
                 id SERIAL PRIMARY KEY,
                 series_id INTEGER REFERENCES series(id),
                 season INTEGER DEFAULT 1,
                 episode_number INTEGER NOT NULL,
-                telegram_message_id INTEGER UNIQUE NOT NULL,
+                telegram_message_id INTEGER NOT NULL,
                 telegram_channel_id VARCHAR(255),
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        # إنشاء فهرس لتسريع البحث
+        
+        # إزالة القيد الفريد القديم على telegram_message_id إذا كان موجوداً (لأنه سيتعارض مع الجديد)
+        # نستخدم كتلة try/except لأن القيد قد لا يكون موجوداً
+        try:
+            conn.execute(text("ALTER TABLE episodes DROP CONSTRAINT IF EXISTS episodes_telegram_message_id_key"))
+            print("✅ تم إزالة القيد الفريد القديم على telegram_message_id.")
+        except Exception as e:
+            print(f"⚠️ ملاحظة أثناء إزالة القيد: {e}")
+        
+        # إضافة قيد فريد جديد على (telegram_channel_id, telegram_message_id)
+        conn.execute(text("""
+            ALTER TABLE episodes 
+            ADD CONSTRAINT unique_channel_message UNIQUE (telegram_channel_id, telegram_message_id)
+        """))
+        print("✅ تم إضافة القيد الفريد (telegram_channel_id, telegram_message_id).")
+        
+        # إنشاء الفهارس الأخرى
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_series_name_type ON series(name, type)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_telegram_msg_id ON episodes(telegram_message_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_channel_id ON episodes(telegram_channel_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_episodes_series_season ON episodes(series_id, season, episode_number)"))
-    print("✅ تم التحقق من هياكل الجداول والفهارس.")
+        
+    print("✅ تم التحقق من هياكل الجداول والفهارس وتحديث القيود.")
 except Exception as e:
-    print(f"⚠️ ملاحظة حول الجداول: {e}")
+    print(f"⚠️ خطأ أثناء تعديل الجداول: {e}")
+    # قد يكون القيد موجوداً بالفعل، نواصل التشغيل
 
 # ==============================
 # 4. دوال المساعدة (التحليل والحفظ والحذف)
@@ -258,7 +277,7 @@ async def get_channel_entity(client, channel_input):
         return None
 
 def save_to_database(name, content_type, season_num, episode_num, telegram_msg_id, channel_id, series_id=None):
-    """حفظ المحتوى في قاعدة البيانات مع التحقق من نجاح الإدراج."""
+    """حفظ المحتوى في قاعدة البيانات مع التحقق من نجاح الإدراج باستخدام المفتاح المركب (channel, message)."""
     try:
         with engine.begin() as conn:
             # البحث عن المسلسل/الفيلم بنفس الاسم والنوع
@@ -292,13 +311,13 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
                 series_id = result[0]
             
             # إضافة الحلقة/الجزء مع معرف القناة
-            # نستخدم ON CONFLICT على telegram_message_id لأنه معرف فريد
+            # استخدام ON CONFLICT على (telegram_channel_id, telegram_message_id) لأنه المفتاح الفريد الصحيح
             result = conn.execute(
                 text("""
                     INSERT INTO episodes (series_id, season, episode_number, 
                            telegram_message_id, telegram_channel_id)
                     VALUES (:sid, :season, :ep_num, :msg_id, :channel)
-                    ON CONFLICT (telegram_message_id) DO NOTHING
+                    ON CONFLICT (telegram_channel_id, telegram_message_id) DO NOTHING
                 """),
                 {
                     "sid": series_id,
@@ -311,7 +330,7 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
             
             # التحقق من نجاح الإدراج (rowcount سيكون 1 إذا تم الإدراج، 0 إذا كان موجودًا مسبقًا)
             if result.rowcount == 0:
-                print(f"⏭️ الحلقة موجودة مسبقاً: {name} - الموسم {season_num} الحلقة {episode_num} (msg_id: {telegram_msg_id})")
+                print(f"⏭️ الحلقة موجودة مسبقاً: {name} - الموسم {season_num} الحلقة {episode_num} (msg_id: {telegram_msg_id}, channel: {channel_id})")
                 return False  # لم تتم الإضافة (موجودة مسبقاً)
             
         type_arabic = "مسلسل" if content_type == 'series' else "فيلم"
@@ -325,20 +344,33 @@ def save_to_database(name, content_type, season_num, episode_num, telegram_msg_i
         print(f"❌ خطأ في قاعدة البيانات: {e}")
         return False
 
-def delete_from_database(message_id):
+def delete_from_database(message_id, channel_id=None):
     """حذف حلقة/جزء من قاعدة البيانات عند حذفها من القناة."""
     try:
         with engine.begin() as conn:
-            # البحث عن الحلقة المراد حذفها
-            episode_result = conn.execute(
-                text("""
-                    SELECT e.id, e.series_id, s.name, s.type, e.season, e.episode_number, e.telegram_channel_id
-                    FROM episodes e
-                    JOIN series s ON e.series_id = s.id
-                    WHERE e.telegram_message_id = :msg_id
-                """),
-                {"msg_id": message_id}
-            ).fetchone()
+            # البحث عن الحلقة المراد حذفها (نحتاج channel_id لتحديدها بدقة)
+            if channel_id:
+                # إذا كان لدينا channel_id، نستخدمه مع message_id
+                episode_result = conn.execute(
+                    text("""
+                        SELECT e.id, e.series_id, s.name, s.type, e.season, e.episode_number, e.telegram_channel_id
+                        FROM episodes e
+                        JOIN series s ON e.series_id = s.id
+                        WHERE e.telegram_message_id = :msg_id AND e.telegram_channel_id = :channel
+                    """),
+                    {"msg_id": message_id, "channel": channel_id}
+                ).fetchone()
+            else:
+                # للتوافق مع الإصدارات السابقة، نبحث بالرسالة فقط (قد يكون هناك عدة)
+                episode_result = conn.execute(
+                    text("""
+                        SELECT e.id, e.series_id, s.name, s.type, e.season, e.episode_number, e.telegram_channel_id
+                        FROM episodes e
+                        JOIN series s ON e.series_id = s.id
+                        WHERE e.telegram_message_id = :msg_id
+                    """),
+                    {"msg_id": message_id}
+                ).fetchone()
             
             if not episode_result:
                 print(f"⚠️ لم يتم العثور على الحلقة {message_id} في قاعدة البيانات")
@@ -417,7 +449,8 @@ async def check_deleted_messages(client, channel):
                 print(f"   تم العثور على {len(deleted_ids)} رسالة محذوفة في {channel.title}")
                 for msg_id in deleted_ids:
                     print(f"   🗑️ معالجة الرسالة المحذوفة: {msg_id}")
-                    delete_from_database(msg_id)
+                    # نمرر channel_id لتحديد الحلقة بدقة
+                    delete_from_database(msg_id, channel_id)
             else:
                 print(f"   ✅ لا توجد رسائل محذوفة في {channel.title}")
                 
@@ -546,9 +579,12 @@ async def monitor_channels():
         # مراقبة حذف الرسائل من جميع القنوات
         @client.on(events.MessageDeleted(chats=channel_entities))
         async def delete_handler(event):
+            # لسنا متأكدين من القناة التي حدث فيها الحذف، لذا نستخدم الدالة القديمة (بدون channel_id)
+            # ولكن يمكن تحسين ذلك إذا أمكن الحصول على القناة من الحدث
             for msg_id in event.deleted_ids:
                 print(f"🗑️ تم حذف رسالة: {msg_id}")
-                delete_from_database(msg_id)
+                # نمرر None للـ channel_id، وستبحث الدالة عن أي حلقة بهذا المعرف
+                delete_from_database(msg_id, None)
         
         print("\n🎯 جاهز لمراقبة القنوات:")
         for i, chan in enumerate(channel_entities, 1):
