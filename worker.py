@@ -25,6 +25,7 @@ CHECK_DELETED_MESSAGES = os.environ.get("CHECK_DELETED_MESSAGES", "true").lower(
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
 RESET_DATABASE = os.environ.get("RESET_DATABASE", "false").lower() == "true"
 SYNC_LIMIT = int(os.environ.get("SYNC_LIMIT", "10000"))  # عدد الرسائل للمزامنة الأولية (0 = غير محدود)
+FORCE_SYNC = os.environ.get("FORCE_SYNC", "false").lower() == "true"  # تشغيل الفحص الإجباري لجميع الرسائل
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -186,12 +187,11 @@ def has_video_media(msg):
                         return True
                 elif isinstance(attr, types.DocumentAttributeVideo):
                     return True
-        # التحقق من الحجم (قد يكون فيديو إذا كان أكبر من 1 ميجابايت وكان mime غير معروف)
-        if msg.document.size > 1024 * 1024 and 'octet-stream' in mime:
+        # التحقق من الحجم (قد يكون فيديو إذا كان أكبر من 5 ميجابايت)
+        if msg.document.size > 5 * 1024 * 1024:
             return True
     # التحقق من وجود media (للتأكد)
     if msg.media and hasattr(msg.media, 'document'):
-        # تكرار نفس الفحص
         doc = msg.media.document
         mime = doc.mime_type or ''
         if mime.startswith('video/'):
@@ -203,7 +203,7 @@ def has_video_media(msg):
                     return True
             elif isinstance(attr, types.DocumentAttributeVideo):
                 return True
-        if doc.size > 1024 * 1024 and 'octet-stream' in mime:
+        if doc.size > 5 * 1024 * 1024:
             return True
     return False
 
@@ -220,6 +220,8 @@ def parse_content_info(msg_text, channel_id, has_video):
 
     original_text = msg_text.strip()
     text = original_text
+
+    logger.debug(f"محاولة تحليل: {original_text[:100]}")
 
     # إزالة الكلمات الشائعة من البداية
     common_prefixes = ['مشاهدة', 'تحميل', 'الآن', 'مسلسل', 'فيلم', 'شاهد', 'مترجم', 'حلقة', 'المسلسل', 'مشاهده']
@@ -262,6 +264,7 @@ def parse_content_info(msg_text, channel_id, has_video):
             try:
                 name, season, episode = extractor(match)
                 content_type = 'series'
+                logger.debug(f"نمط مطابق: {pattern} -> {name} م{season} ح{episode}")
                 break
             except:
                 continue
@@ -280,6 +283,7 @@ def parse_content_info(msg_text, channel_id, has_video):
             # إذا كان هناك فيديو ولم نتمكن من التحليل، نستخدم النص كاملاً كفيلم (احتياطي)
             content_type = 'movie'
             name = original_text
+            logger.debug(f"لم يتم التعرف على نمط، استخدام النص كفيلم")
 
     # تنظيف الاسم
     name = re.sub(r'\s+', ' ', name).strip()
@@ -288,7 +292,7 @@ def parse_content_info(msg_text, channel_id, has_video):
     if not name:
         name = original_text[:200]
 
-    logger.debug(f"تم تحليل: '{original_text[:50]}...' -> {name}, {content_type}, S{season}E{episode}")
+    logger.debug(f"نتيجة التحليل: '{original_text[:50]}...' -> {name}, {content_type}, S{season}E{episode}")
     return name, content_type, season, episode
 
 # ------------------------------
@@ -415,7 +419,7 @@ def fix_misclassified_series():
         logger.error(f"❌ خطأ في تصحيح التصنيف: {e}")
 
 # ------------------------------
-# مزامنة القنوات
+# دوال المزامنة
 # ------------------------------
 async def sync_channel_messages(client, channel):
     chan_id = f"@{channel.username}" if channel.username else str(channel.id)
@@ -424,11 +428,17 @@ async def sync_channel_messages(client, channel):
 
     messages = []
     async for msg in client.iter_messages(channel, limit=limit):
-        if msg.text:
+        if msg.text or msg.media:
             messages.append(msg)
     messages.reverse()
-    logger.info(f"📊 تم جلب {len(messages)} رسالة نصية" + (f" (آخر {SYNC_LIMIT})" if limit else " (كامل التاريخ)"))
+    logger.info(f"📊 تم جلب {len(messages)} رسالة" + (f" (آخر {SYNC_LIMIT})" if limit else " (كامل التاريخ)"))
 
+    # تجميع الرسائل حسب grouped_id لمعالجة الألبومات
+    grouped = defaultdict(list)
+    for msg in messages:
+        if msg.grouped_id:
+            grouped[msg.grouped_id].append(msg)
+    
     with engine.connect() as conn:
         stored = conn.execute(
             text("SELECT telegram_message_id FROM episodes WHERE telegram_channel_id = :chan"),
@@ -440,28 +450,54 @@ async def sync_channel_messages(client, channel):
     skipped = 0
     failed_parse = 0
     no_video = 0
+    processed_ids = set()
 
+    # معالجة المجموعات أولاً
+    for group_id, group_msgs in grouped.items():
+        video_msg = next((m for m in group_msgs if has_video_media(m)), None)
+        if not video_msg:
+            continue
+        if video_msg.id in stored_set or video_msg.id in processed_ids:
+            continue
+        # البحث عن رسالة تحتوي على نص في نفس المجموعة
+        text_msg = next((m for m in group_msgs if m.text and not has_video_media(m)), None)
+        content_text = text_msg.text if text_msg else video_msg.text or ""
+        has_vid = True
+        name, typ, season, ep = parse_content_info(content_text, chan_id, has_vid)
+        if not name:
+            name = f"Unnamed_Group_{group_id}"
+            typ = "movie"
+            season = 1
+            ep = 1
+            logger.debug(f"استخدام اسم افتراضي للمجموعة {group_id}")
+        if save_to_database(name, typ, season, ep, video_msg.id, chan_id):
+            new += 1
+            processed_ids.add(video_msg.id)
+        # يمكن إضافة باقي رسائل المجموعة كمراجع إذا أردت، لكننا نكتفي بالفيديو الرئيسي
+
+    # معالجة الرسائل الفردية (غير المجمعة)
     for msg in messages:
-        if msg.id in stored_set:
+        if msg.id in processed_ids or msg.id in stored_set:
             skipped += 1
             continue
 
-        has_video = has_video_media(msg)
-        if not has_video:
+        has_vid = has_video_media(msg)
+        if not has_vid:
             no_video += 1
             # تحديث السياق إذا أمكن
-            name, typ, season, ep = parse_content_info(msg.text, chan_id, has_video)
-            if name and not has_video and typ == 'series' and not re.search(r'\d+', name):
+            name, typ, season, ep = parse_content_info(msg.text or "", chan_id, has_vid)
+            if name and not has_vid and typ == 'series' and not re.search(r'\d+', name):
                 save_channel_context(chan_id, name)
             continue
 
-        name, typ, season, ep = parse_content_info(msg.text, chan_id, has_video)
+        name, typ, season, ep = parse_content_info(msg.text or "", chan_id, has_vid)
 
         if name and typ and ep:
             if save_to_database(name, typ, season, ep, msg.id, chan_id):
                 new += 1
                 stored_set.add(msg.id)
             else:
+                # فشل الإدراج - قد يكون موجوداً مسبقاً
                 with engine.connect() as conn2:
                     exists = conn2.execute(
                         text("SELECT 1 FROM episodes WHERE telegram_message_id = :mid"),
@@ -474,21 +510,26 @@ async def sync_channel_messages(client, channel):
                         logger.error(f"❌ فشل إدراج {msg.id} (غير معروف السبب)")
         else:
             failed_parse += 1
-            logger.debug(f"⚠️ فشل تحليل الرسالة {msg.id}: {msg.text[:50]}...")
+            logger.warning(f"⚠️ فشل تحليل الرسالة {msg.id}: {msg.text[:100] if msg.text else 'بدون نص'}")
 
     logger.info(f"✅ {channel.title}: {new} جديدة, {skipped} موجودة, {failed_parse} فشل تحليل, {no_video} بدون فيديو")
 
 async def import_channel_history(client, channel):
-    """استيراد جميع الرسائل القديمة (بدون حد)"""
+    """استيراد جميع الرسائل القديمة (بدون حد) - استدعاء sync_channel_messages بدون حد"""
+    # نفس دالة المزامنة ولكن بدون حد (limit=None)
+    await sync_channel_messages(client, channel)  # مع SYNC_LIMIT <= 0 ستجلب الكل
+
+async def force_sync_all_messages(client, channel):
+    """إعادة معالجة جميع الرسائل في القناة بغض النظر عن وجودها (فحص إجباري)"""
     chan_id = f"@{channel.username}" if channel.username else str(channel.id)
-    logger.info(f"\n📂 استيراد كامل {channel.title}")
+    logger.info(f"\n🔁 فحص إجباري لـ {channel.title} ({chan_id}) - جلب كل الرسائل")
 
     all_msgs = []
     async for msg in client.iter_messages(channel, limit=None):
-        if msg.text:
+        if msg.text or msg.media:
             all_msgs.append(msg)
-    all_msgs.reverse()
-    logger.info(f"📊 تم جلب {len(all_msgs)} رسالة نصية (كامل التاريخ)")
+    # لا نعكس الترتيب هنا لأننا نريد الأحدث أولاً؟ لا يهم، سنعالج الكل
+    logger.info(f"📊 تم جلب {len(all_msgs)} رسالة (كامل التاريخ)")
 
     with engine.connect() as conn:
         stored = conn.execute(
@@ -498,45 +539,20 @@ async def import_channel_history(client, channel):
     stored_set = {r[0] for r in stored}
 
     new = 0
-    skipped = 0
-    failed_parse = 0
-    no_video = 0
-
     for msg in all_msgs:
         if msg.id in stored_set:
-            skipped += 1
             continue
-
-        has_video = has_video_media(msg)
-        if not has_video:
-            no_video += 1
-            name, typ, season, ep = parse_content_info(msg.text, chan_id, has_video)
-            if name and not has_video and typ == 'series' and not re.search(r'\d+', name):
-                save_channel_context(chan_id, name)
-            continue
-
-        name, typ, season, ep = parse_content_info(msg.text, chan_id, has_video)
-
-        if name and typ and ep:
+        if has_video_media(msg):
+            name, typ, season, ep = parse_content_info(msg.text or "", chan_id, True)
+            if not name:
+                name = f"Unnamed_{msg.id}"
+                typ = "movie"
+                season = 1
+                ep = 1
             if save_to_database(name, typ, season, ep, msg.id, chan_id):
                 new += 1
-                stored_set.add(msg.id)
-            else:
-                with engine.connect() as conn2:
-                    exists = conn2.execute(
-                        text("SELECT 1 FROM episodes WHERE telegram_message_id = :mid"),
-                        {"mid": msg.id}
-                    ).scalar()
-                    if exists:
-                        skipped += 1
-                    else:
-                        failed_parse += 1
-                        logger.error(f"❌ فشل إدراج {msg.id} (غير معروف السبب)")
-        else:
-            failed_parse += 1
-            logger.debug(f"⚠️ فشل تحليل الرسالة {msg.id}: {msg.text[:50]}...")
 
-    logger.info(f"📥 {channel.title}: {new} جديدة, {skipped} موجودة, {failed_parse} فشل تحليل, {no_video} بدون فيديو")
+    logger.info(f"✅ الفحص الإجباري لـ {channel.title}: تمت إضافة {new} حلقة جديدة")
 
 async def check_deleted_messages(client, channel):
     chan_id = f"@{channel.username}" if channel.username else str(channel.id)
@@ -590,10 +606,15 @@ async def monitor_channels():
     for ch in channels:
         await sync_channel_messages(client, ch)
 
-    # استيراد كامل إذا مفعل
-    if IMPORT_HISTORY:
+    # استيراد كامل إذا مفعل (ولم يتم بالفعل في المزامنة)
+    if IMPORT_HISTORY and SYNC_LIMIT > 0:
         for ch in channels:
             await import_channel_history(client, ch)
+
+    # فحص إجباري إذا مفعل
+    if FORCE_SYNC:
+        for ch in channels:
+            await force_sync_all_messages(client, ch)
 
     clean_orphan_series()
     fix_misclassified_series()
@@ -605,13 +626,13 @@ async def monitor_channels():
     @client.on(events.NewMessage(chats=channels))
     async def handler(event):
         msg = event.message
-        if msg.text:
+        if msg.text or msg.media:
             chan_id = f"@{msg.chat.username}" if msg.chat.username else str(msg.chat.id)
-            has_video = has_video_media(msg)
-            name, typ, season, ep = parse_content_info(msg.text, chan_id, has_video)
-            if has_video and name and typ and ep:
+            has_vid = has_video_media(msg)
+            name, typ, season, ep = parse_content_info(msg.text or "", chan_id, has_vid)
+            if has_vid and name and typ and ep:
                 save_to_database(name, typ, season, ep, msg.id, chan_id)
-            elif name and not has_video and typ == 'series' and not re.search(r'\d+', name):
+            elif name and not has_vid and typ == 'series' and not re.search(r'\d+', name):
                 save_channel_context(chan_id, name)
                 series_context[chan_id] = name
 
